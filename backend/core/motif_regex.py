@@ -5,7 +5,7 @@ COMPLEMENT = str.maketrans('ACGTRYSWKMBDHVNacgtryswkmbdhvn', 'TGCAYRWSMKVHDBNtgc
 
 class MotifRegex:
     def __init__(self, regex_pattern: str):
-        self.regex_pattern = regex_pattern.upper()
+        self.regex_pattern = regex_pattern.replace('(', '[').replace(')', ']').upper()
         self.forward_regex_pattern = self._get_forward_pattern(self.regex_pattern)
         self.reverse_regex_pattern = self._get_reverse_pattern(self.regex_pattern)
 
