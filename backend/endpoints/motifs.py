@@ -1,5 +1,6 @@
 import json
 import math
+from typing import Optional
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from starlette.responses import StreamingResponse
@@ -16,61 +17,124 @@ router = APIRouter()
 @router.post("/", status_code=200)
 async def find_motifs(
         file: UploadFile = File(...),
-        motif_pattern: str = Form(..., description="IUPAC motif pattern or regex with brackets"),
+        motif_pattern: str = Form(..., description="IUPAC motif pattern with optional bracket groups"),
+        p_value_threshold: float = Form(1e-4),
+        score_threshold: Optional[int] = Form(None),
+        scan_reverse_complement: bool = Form(True),
 ):
-    if not file.filename.endswith(('.fasta', '.fa', '.fna')):
+    filename = file.filename or ""
+    if not filename.endswith((".fasta", ".fa", ".fna")):
         raise HTTPException(status_code=400, detail="O formato deve ser FASTA.")
 
+    if score_threshold is None and not 0 < p_value_threshold <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="p_value_threshold deve estar no intervalo (0, 1].",
+        )
+
     bg_freqs = await BackgroundFrequencies.calculate_from_file(file)
-    await file.seek(0)  # Volta o ponteiro do arquivo para o início para a leitura subsequente
+    await file.seek(0)
 
     try:
-        # Fita Forward
         pfm = PositionWeightMatrix.parse_motif_pattern_to_pfm(motif_pattern)
         pwm_fwd = PositionWeightMatrix.build_integer_pwm(pfm, bg_freqs)
         pcalc_fwd = PValueCalculator(pwm_fwd, bg_freqs)
 
-        # Fita Reverse Complement
         pwm_rev = PositionWeightMatrix.get_reverse_complement(pwm_fwd)
         pcalc_rev = PValueCalculator(pwm_rev, bg_freqs)
 
-        W = pwm_fwd.shape[1]
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro na construção da matriz: {str(e)}")
+        motif_length = pwm_fwd.shape[1]
+        if score_threshold is None:
+            cutoff_fwd = pcalc_fwd.get_score_threshold_for_pvalue(p_value_threshold)
+            cutoff_rev = pcalc_rev.get_score_threshold_for_pvalue(p_value_threshold)
+            cutoff_mode = "pvalue"
+        else:
+            cutoff_fwd = score_threshold
+            cutoff_rev = score_threshold
+            cutoff_mode = "score"
 
-    P_VALUE_THRESHOLD = 1e-4
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro na construcao da matriz: {str(e)}")
 
     async def process_and_stream():
         fasta_reader = FastaReader(file)
+        scan_configs = [
+            ("forward", "+", pwm_fwd, pcalc_fwd, cutoff_fwd),
+        ]
+
+        if scan_reverse_complement:
+            scan_configs.append(("reverse", "-", pwm_rev, pcalc_rev, cutoff_rev))
+
+        matches = []
 
         async for record in fasta_reader.parse():
-            current_pwm = pwm_rev if record.is_reverse else pwm_fwd
-            current_pcalc = pcalc_rev if record.is_reverse else pcalc_fwd
+            record_length = len(record.sequence)
+            record_orientation = "reverse_complement" if record.is_reverse else "forward"
 
-            hit_positions, hit_scores = SequenceScanner.scan_integer_matrix(
-                sequence=record.sequence,
-                pwm=current_pwm,
-                threshold=0
-            )
+            for strand_name, strand_symbol, pwm, pcalc, cutoff in scan_configs:
+                hit_positions, hit_scores = SequenceScanner.scan_integer_matrix(
+                    sequence=record.sequence,
+                    pwm=pwm,
+                    threshold=cutoff,
+                )
 
-            for pos_idx, score in zip(hit_positions, hit_scores):
+                for pos_idx, score in zip(hit_positions, hit_scores):
+                    score = int(score)
+                    p_value = float(pcalc.get_pvalue(score))
 
-                p_value = current_pcalc.get_pvalue(int(score))
+                    if score_threshold is None and p_value > p_value_threshold:
+                        continue
 
-                if p_value <= P_VALUE_THRESHOLD:
-                    motif_seq = record.sequence[pos_idx: pos_idx + W]
+                    start = int(pos_idx) + 1
+                    end = start + motif_length - 1
+                    sequence_window = record.sequence[pos_idx:pos_idx + motif_length]
+                    matched_sequence = (
+                        PositionWeightMatrix.reverse_complement_sequence(sequence_window)
+                        if strand_symbol == "-"
+                        else sequence_window
+                    )
 
-                    final_pos = pos_idx + 1
                     if record.is_reverse:
-                        final_pos = 1000 - final_pos - W + 2
+                        source_start = record_length - end + 1
+                        source_end = record_length - start + 1
+                        source_strand_symbol = "-" if strand_symbol == "+" else "+"
+                    else:
+                        source_start = start
+                        source_end = end
+                        source_strand_symbol = strand_symbol
 
-                    yield json.dumps({
+                    source_strand = "reverse" if source_strand_symbol == "-" else "forward"
+
+                    neg_log10_pval = round(-math.log10(p_value), 2) if p_value > 0 else None
+
+                    matches.append({
                         "gene": record.gene_id,
-                        "strand": "reverse" if record.is_reverse else "forward",
-                        "motif": motif_seq,
-                        "position": int(final_pos),
+                        "record_orientation": record_orientation,
+                        "strand": strand_name,
+                        "strand_symbol": strand_symbol,
+                        "source_strand": source_strand,
+                        "source_strand_symbol": source_strand_symbol,
+                        "matched_sequence": matched_sequence,
+                        "position": start,
+                        "end_position": end,
+                        "source_position": source_start,
+                        "source_end_position": source_end,
+                        "score": score,
                         "p_value": f"{p_value:.2e}",
-                        "-log10_pval": round(-math.log10(p_value) if p_value > 0 else 0, 2)
-                    }) + "\n"
+                        "p_value_numeric": p_value,
+                        "-log10_pval": neg_log10_pval,
+                    })
+
+        yield json.dumps({
+            "metadata": {
+                "filename": filename,
+                "motif_pattern": motif_pattern,
+                "motif_length": motif_length,
+                "score_threshold": score_threshold,
+                "cutoff_mode": cutoff_mode,
+                "background_frequencies": bg_freqs,
+            },
+            "matches": matches,
+        })
 
     return StreamingResponse(process_and_stream(), media_type="application/x-ndjson")

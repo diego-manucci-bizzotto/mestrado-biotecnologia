@@ -53,3 +53,15 @@ class PValueCalculator:
         if score <= self.min_score:
             return 1.0
         return self.pvalue_table[score + self.offset]
+
+    def get_score_threshold_for_pvalue(self, pvalue_threshold: float) -> int:
+        if pvalue_threshold <= 0:
+            return self.max_score + 1
+        if pvalue_threshold >= 1:
+            return self.min_score
+
+        for score in range(self.min_score, self.max_score + 1):
+            if self.pvalue_table[score + self.offset] <= pvalue_threshold:
+                return score
+
+        return self.max_score + 1

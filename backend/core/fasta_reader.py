@@ -58,12 +58,13 @@ class FastaReader:
                 gene_id = part[1:-1]
                 break
 
-        is_reverse = "[reverse complement]" in header.lower()
+        if not gene_id and parts:
+            gene_id = parts[0]
 
-        clean_seq = sequence.replace("N", "")
+        is_reverse = "[reverse complement]" in header.lower()
 
         return FastaRecord(
             gene_id=gene_id,
-            sequence=clean_seq,
+            sequence=sequence,
             is_reverse=is_reverse
         )

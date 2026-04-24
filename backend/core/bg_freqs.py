@@ -9,16 +9,32 @@ class BackgroundFrequencies:
     @staticmethod
     async def calculate_from_file(file: UploadFile, chunk_size: int = ONE_MEGABYTE) -> Dict[str, float]:
         total_counts = Counter()
+        buffer = ""
+        in_header = False
 
         while contents := await file.read(chunk_size):
-            text = contents.decode('utf-8')
+            text = buffer + contents.decode('utf-8')
             lines = text.split('\n')
+            buffer = lines.pop()
 
-            clean_seq = "".join([line.upper() for line in lines if not line.startswith('>')])
+            for line in lines:
+                line = line.strip().upper()
+                if not line:
+                    continue
 
-            clean_seq = clean_seq.replace('N', '')
+                if line.startswith('>'):
+                    in_header = True
+                    continue
 
-            total_counts.update(clean_seq)
+                if in_header:
+                    in_header = False
+
+                total_counts.update(base for base in line if base in "ACGT")
+
+        if buffer:
+            line = buffer.strip().upper()
+            if line and not line.startswith('>') and not in_header:
+                total_counts.update(base for base in line if base in "ACGT")
 
         total_bases = sum(total_counts.values())
 
