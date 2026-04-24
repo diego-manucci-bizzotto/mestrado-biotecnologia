@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
-from endpoints import motifs, motifs2
+from endpoints import motifs
 
 api_router = APIRouter()
 
-api_router.include_router(motifs2.router, prefix="/motifs", tags=["Motifs"])
+api_router.include_router(motifs.router, prefix="/motifs", tags=["Motifs"])

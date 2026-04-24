@@ -1,115 +1,76 @@
+import json
 import math
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from starlette.responses import StreamingResponse
 
-from core.fasta import Fasta
-from core.motif_regex import MotifRegex
-from core.p_value import PValue
-from core.pwm_p_value import PWMPValue
+from core.bg_freqs import BackgroundFrequencies
+from core.fasta_reader import FastaReader
+from core.p_value_calc import PValueCalculator
+from core.pwm import PositionWeightMatrix
+from core.seq_scanner import SequenceScanner
 
 router = APIRouter()
-
-raw_matrix = [
-    {'A': 20, 'C': 48, 'G': 18, 'T': 14},  # Pos 1
-    {'A': 28, 'C': 22, 'G': 17, 'T': 32},  # Pos 2
-    {'A': 37, 'C': 30, 'G': 22, 'T': 11},  # Pos 3
-    {'A': 63, 'C': 36, 'G': 1, 'T': 1},  # Pos 4
-    {'A': 0, 'C': 0, 'G': 100, 'T': 0},  # Pos 5 (G)
-    {'A': 0, 'C': 100, 'G': 0, 'T': 0},  # Pos 6 (C)
-    {'A': 0, 'C': 99, 'G': 0, 'T': 0},  # Pos 7 (C)
-    {'A': 42, 'C': 30, 'G': 7, 'T': 21},  # Pos 8
-    {'A': 7, 'C': 76, 'G': 8, 'T': 8}  # Pos 9
-]
-
-bg_freqs = {'A': 0.25, 'C': 0.25, 'G': 0.25, 'T': 0.25}
-pseudocount = 0.01
-epsilon = 0.1
-pwm_matrix = []
-
-# Transformando porcentagens em Log-Razão Inteira (Granularidade da Definição 3 do artigo)
-for col in raw_matrix:
-    col_inteira = {}
-    for base in ['A', 'C', 'G', 'T']:
-        prob = (col[base] / 100.0) + pseudocount
-        prob_normalizada = prob / (1.0 + (4 * pseudocount))
-        log_odds = math.log2(prob_normalizada / bg_freqs[base])
-        score_discreto = math.floor(log_odds / epsilon)
-        col_inteira[base] = score_discreto
-    pwm_matrix.append(col_inteira)
-
-pwm_calculator = PWMPValue(pwm=pwm_matrix, background_frequencies=bg_freqs)
 
 
 @router.post("/", status_code=200)
 async def find_motifs(
         file: UploadFile = File(...),
-        regex: str = Form(...)
+        motif_pattern: str = Form(..., description="IUPAC motif pattern or regex with brackets"),
 ):
-    if not file.filename.endswith(('.fasta', '.fa')):
-        raise HTTPException(status_code=400, detail="Ficheiro inválido.")
+    if not file.filename.endswith(('.fasta', '.fa', '.fna')):
+        raise HTTPException(status_code=400, detail="O formato deve ser FASTA.")
 
-    if not regex:
-        raise HTTPException(status_code=400, detail="Padrão regex é obrigatório.")
+    bg_freqs = await BackgroundFrequencies.calculate_from_file(file)
+    await file.seek(0)  # Volta o ponteiro do arquivo para o início para a leitura subsequente
 
-    motif_regex = MotifRegex(regex)
+    try:
+        # Fita Forward
+        pfm = PositionWeightMatrix.parse_motif_pattern_to_pfm(motif_pattern)
+        pwm_fwd = PositionWeightMatrix.build_integer_pwm(pfm, bg_freqs)
+        pcalc_fwd = PValueCalculator(pwm_fwd, bg_freqs)
 
-    results = []
-    fasta_stream = Fasta(file)
+        # Fita Reverse Complement
+        pwm_rev = PositionWeightMatrix.get_reverse_complement(pwm_fwd)
+        pcalc_rev = PValueCalculator(pwm_rev, bg_freqs)
 
-    async for record in fasta_stream:
-        regex_pattern = motif_regex.forward_regex_pattern if not record.is_reverse else motif_regex.reverse_regex_pattern
+        W = pwm_fwd.shape[1]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro na construção da matriz: {str(e)}")
 
-        for match in regex_pattern.finditer(record.sequence):
-            motif_sequence = match.group(1).upper()
+    P_VALUE_THRESHOLD = 1e-4
 
-            if len(motif_sequence) != pwm_calculator.m:
-                continue  # Pula se não tiver o tamanho exato da PWM
+    async def process_and_stream():
+        fasta_reader = FastaReader(file)
 
-            # 4. CALCULAR O SCORE ALVO DA SEQUENCIA ENCONTRADA (Ex: "CAGCGCCCA")
-            hit_score = 0
-            for i, base in enumerate(motif_sequence):
-                hit_score += pwm_matrix[i].get(base, 0)
+        async for record in fasta_reader.parse():
+            current_pwm = pwm_rev if record.is_reverse else pwm_fwd
+            current_pcalc = pcalc_rev if record.is_reverse else pcalc_fwd
 
-            # Cálculo de background isolado (o seu original)
-            p_value = PValue(motif_sequence, record.sequence)
-
-            # 5. GERAR O P-VALUE EXATO DA PWM PASSANDO O SCORE ALVO
-            pwm_p_val = pwm_calculator.calculate_p_value(threshold_score=hit_score)
-
-            pos = match.start() + 1
-            if record.is_reverse:
-                pos = 1000 - pos - len(motif_sequence) + 2
-
-            results.append(
-                {
-                    "gene": record.gene_id,
-                    "type": "reverse" if record.is_reverse else "forward",
-                    "motif": motif_sequence,
-                    "position": pos,
-                    "p_value": f"{p_value.value:.2e}",
-                    "log_p_value": -math.log10(p_value.value) if p_value.value > 0 else 0,
-                    "pwm_p_value": f"{pwm_p_val:.2e}"
-                }
+            hit_positions, hit_scores = SequenceScanner.scan_integer_matrix(
+                sequence=record.sequence,
+                pwm=current_pwm,
+                threshold=0
             )
 
-    return {
-        "metadata": {
-            "filename": file.filename,
-            "patterns": {"forward": motif_regex.forward_regex_pattern, "reverse": motif_regex.reverse_regex_pattern},
-            "summary": {
-                "total_hits": len(results),
-            }
-        },
-        "hits": results
-    }
+            for pos_idx, score in zip(hit_positions, hit_scores):
 
-#   if results:
-#       return "".join(json.dumps(res) + "\n" for res in results)
-#   return ""
-#
-#   return {
-#       "metadata": {"filename": file.filename, "pattern": forward_pattern},
-#       "hits": results
-#   }
-#
-# StreamingResponse(fasta_stream_generator(), media_type="application/x-ndjson")
+                p_value = current_pcalc.get_pvalue(int(score))
+
+                if p_value <= P_VALUE_THRESHOLD:
+                    motif_seq = record.sequence[pos_idx: pos_idx + W]
+
+                    final_pos = pos_idx + 1
+                    if record.is_reverse:
+                        final_pos = 1000 - final_pos - W + 2
+
+                    yield json.dumps({
+                        "gene": record.gene_id,
+                        "strand": "reverse" if record.is_reverse else "forward",
+                        "motif": motif_seq,
+                        "position": int(final_pos),
+                        "p_value": f"{p_value:.2e}",
+                        "-log10_pval": round(-math.log10(p_value) if p_value > 0 else 0, 2)
+                    }) + "\n"
+
+    return StreamingResponse(process_and_stream(), media_type="application/x-ndjson")
