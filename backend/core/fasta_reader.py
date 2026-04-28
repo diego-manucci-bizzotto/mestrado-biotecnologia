@@ -49,7 +49,32 @@ class FastaReader:
             current_seq.append(buffer.strip().upper())
             yield self._build_record(current_header, "".join(current_seq))
 
-    def _build_record(self, header: str, sequence: str) -> FastaRecord:
+    @classmethod
+    def parse_text(cls, text: str) -> list[FastaRecord]:
+        records: list[FastaRecord] = []
+        current_header = ""
+        current_seq: list[str] = []
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if line.startswith(">"):
+                if current_header:
+                    records.append(cls._build_record(current_header, "".join(current_seq)))
+                current_header = line
+                current_seq = []
+            else:
+                current_seq.append(line.upper())
+
+        if current_header:
+            records.append(cls._build_record(current_header, "".join(current_seq)))
+
+        return records
+
+    @staticmethod
+    def _build_record(header: str, sequence: str) -> FastaRecord:
         parts = header.replace(">", "").split()
 
         gene_id = ""
