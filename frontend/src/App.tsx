@@ -1,18 +1,14 @@
 import {
-  Activity,
   ArrowDownUp,
-  CheckCircle2,
-  ChevronRight,
   Dna,
   FileJson,
   FileSpreadsheet,
   Filter,
   Loader2,
-  Microscope,
   Search,
   UploadCloud,
 } from "lucide-react"
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import type { ChangeEvent, FormEvent } from "react"
 
 import { Button } from "@/components/ui/button"
@@ -20,6 +16,7 @@ import { Button } from "@/components/ui/button"
 type Base = "A" | "C" | "G" | "T"
 type RunMode = "pvalue" | "score"
 type EngineMode = "custom" | "fimo" | "both"
+type CustomCalibrationMode = "legacy" | "fimo_like"
 type ViewTab = "overview" | "genes" | "matches" | "compare"
 type SortMode = "pvalue" | "score" | "gene" | "position"
 type StrandFilter = "all" | "forward" | "reverse"
@@ -61,6 +58,11 @@ type RawMotifMatch = {
   p_value: string
   p_value_numeric: number
   "-log10_pval": number | null
+  q_value?: string
+  q_value_numeric?: number
+  "-log10_qval"?: number | null
+  score_integer?: number
+  score_log_odds?: number
 }
 
 type ApiPayload = {
@@ -93,6 +95,7 @@ type SingleEnginePayload = {
 
 type MotifMatch = RawMotifMatch & {
   negLog10PValue: number | null
+  negLog10QValue: number | null
 }
 
 type ScanResult = {
@@ -164,14 +167,15 @@ function App() {
   const [file, setFile] = useState<File | null>(null)
   const [profile, setProfile] = useState<FastaProfile | null>(null)
   const [motifPattern, setMotifPattern] = useState("TATAWA")
-  const [runMode, setRunMode] = useState<RunMode>("pvalue")
+  const runMode: RunMode = "pvalue"
   const [engineMode, setEngineMode] = useState<EngineMode>("custom")
-  const [pValueThreshold, setPValueThreshold] = useState("1e-4")
-  const [fimoPValueThreshold, setFimoPValueThreshold] = useState("1e-4")
-  const [scoreThreshold, setScoreThreshold] = useState("")
-  const [scanReverseComplement, setScanReverseComplement] = useState(true)
-  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [customCalibrationMode, setCustomCalibrationMode] = useState<CustomCalibrationMode>("legacy")
+  const pValueThreshold = "1e-4"
+  const fimoPValueThreshold = "1e-4"
+  const scoreThreshold = ""
+  const scanReverseComplement = true
   const [isLoading, setIsLoading] = useState(false)
+  const [loadingProgress, setLoadingProgress] = useState(0)
   const [error, setError] = useState("")
   const [result, setResult] = useState<ScanResult | null>(null)
   const [activeTab, setActiveTab] = useState<ViewTab>("overview")
@@ -208,7 +212,25 @@ function App() {
   }, [matches, searchTerm, sortMode, strandFilter])
 
   const visibleMatches = filteredMatches.slice(0, 300)
-  const currentStep = result ? 3 : isLoading ? 2 : 1
+
+  useEffect(() => {
+    if (!isLoading) {
+      setLoadingProgress(0)
+      return
+    }
+
+    setLoadingProgress(8)
+    const timer = window.setInterval(() => {
+      setLoadingProgress((previous) => {
+        if (previous >= 95) return previous
+        if (previous < 45) return previous + 9
+        if (previous < 75) return previous + 4
+        return previous + 2
+      })
+    }, 450)
+
+    return () => window.clearInterval(timer)
+  }, [isLoading])
 
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const selectedFile = event.target.files?.[0] ?? null
@@ -278,6 +300,7 @@ function App() {
     formData.append("scan_reverse_complement", String(scanReverseComplement))
     formData.append("engine", engineMode)
     formData.append("fimo_p_value_threshold", fimoPValueThreshold)
+    formData.append("custom_calibration_mode", customCalibrationMode)
     if (runMode === "pvalue") {
       formData.append("p_value_threshold", pValueThreshold)
     } else {
@@ -301,10 +324,12 @@ function App() {
         const customMatches = payload.custom.matches.map((match) => ({
           ...match,
           negLog10PValue: match["-log10_pval"],
+          negLog10QValue: match["-log10_qval"] ?? null,
         }))
         const fimoMatches = payload.fimo.matches.map((match) => ({
           ...match,
           negLog10PValue: match["-log10_pval"],
+          negLog10QValue: match["-log10_qval"] ?? null,
         }))
 
         setResult({
@@ -328,6 +353,7 @@ function App() {
         const mappedMatches = payload.matches.map((match) => ({
           ...match,
           negLog10PValue: match["-log10_pval"],
+          negLog10QValue: match["-log10_qval"] ?? null,
         }))
 
         setResult({
@@ -342,6 +368,8 @@ function App() {
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "Scan failed.")
     } finally {
+      setLoadingProgress(100)
+      await new Promise((resolve) => window.setTimeout(resolve, 220))
       setIsLoading(false)
     }
   }
@@ -366,6 +394,8 @@ function App() {
       "score",
       "p_value",
       "neg_log10_p",
+      "q_value",
+      "neg_log10_q",
     ]
     const rows = filteredMatches.map((match) => [
       match.gene,
@@ -376,6 +406,8 @@ function App() {
       String(match.score),
       match.p_value,
       String(match.negLog10PValue ?? ""),
+      String(match.q_value ?? ""),
+      String(match.negLog10QValue ?? ""),
     ])
     downloadText(
       `motif-matches-${safeTimestamp()}.csv`,
@@ -385,38 +417,12 @@ function App() {
   }
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_#eefaf3_0%,_#f8fbf7_48%,_#ffffff_100%)] text-stone-950">
-      <header className="border-b border-stone-200/80 bg-white/80 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-4 sm:px-6">
-          <div className="flex items-center gap-3">
-            <div className="flex size-10 items-center justify-center rounded-[8px] border border-emerald-200 bg-emerald-50 text-emerald-700">
-              <Microscope className="size-5" />
-            </div>
-            <div>
-              <p className="text-xs font-semibold uppercase text-emerald-700">Step by step motif scan</p>
-              <h1 className="text-lg font-semibold sm:text-xl">PWM Motif Explorer</h1>
-            </div>
-          </div>
-          <div className="hidden items-center gap-2 rounded-[8px] border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600 sm:flex">
-            <Activity className="size-4 text-emerald-700" />
-            <code>{API_BASE}/motifs/</code>
-          </div>
-        </div>
-      </header>
-
+    <main className="min-h-screen bg-stone-50 text-stone-950">
       <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6">
-        <StepIndicator currentStep={currentStep} />
-
-        <form className="mt-6 space-y-5" onSubmit={handleSubmit}>
-          <section className="rounded-[10px] border border-stone-200 bg-white p-5 shadow-sm">
-            <div className="mx-auto max-w-3xl">
-              <p className="text-xs font-semibold uppercase text-emerald-700">Step 1</p>
-              <h2 className="mt-1 text-xl font-semibold">Enter motif and attach FASTA</h2>
-              <p className="mt-1 text-sm text-stone-600">
-                Start with one motif input in the center. The base viewer updates while you type.
-              </p>
-
-              <div className="mt-5">
+        {!result && !isLoading ? (
+          <section className="flex min-h-[78vh] items-center justify-center">
+            <form className="w-full max-w-2xl rounded-[10px] border border-stone-200 bg-white p-6 shadow-sm" onSubmit={handleSubmit}>
+              <div>
                 <label className="block text-sm font-medium text-stone-800" htmlFor="motif-pattern">
                   Motif pattern (IUPAC + optional [group])
                 </label>
@@ -450,152 +456,97 @@ function App() {
                 </label>
               </div>
 
-              {profile ? <FastaProfilePanel profile={profile} /> : null}
-
-              <div className="mt-5 rounded-[8px] border border-stone-200 bg-stone-50 p-3">
-                <button
-                  className="flex w-full items-center justify-between text-sm font-medium text-stone-800"
-                  type="button"
-                  onClick={() => setShowAdvanced((prev) => !prev)}
-                >
-                  Advanced options
-                  <ChevronRight className={`size-4 transition ${showAdvanced ? "rotate-90" : ""}`} />
-                </button>
-
-                {showAdvanced ? (
-                  <div className="mt-3 space-y-3 border-t border-stone-200 pt-3">
-                    <div>
-                      <span className="block text-sm font-medium text-stone-800">Scanner engine</span>
-                      <div className="mt-2 grid grid-cols-3 gap-1 rounded-[8px] border border-stone-200 bg-stone-100 p-1">
-                        <button
-                          className={segmentClass(engineMode === "custom")}
-                          type="button"
-                          onClick={() => setEngineMode("custom")}
-                        >
-                          Custom
-                        </button>
-                        <button
-                          className={segmentClass(engineMode === "fimo")}
-                          type="button"
-                          onClick={() => setEngineMode("fimo")}
-                        >
-                          FIMO
-                        </button>
-                        <button
-                          className={segmentClass(engineMode === "both")}
-                          type="button"
-                          onClick={() => setEngineMode("both")}
-                        >
-                          Both
-                        </button>
-                      </div>
-                    </div>
-
-                    <div>
-                      <span className="block text-sm font-medium text-stone-800">Threshold mode</span>
-                      <div className="mt-2 grid grid-cols-2 gap-1 rounded-[8px] border border-stone-200 bg-stone-100 p-1">
-                        <button
-                          className={segmentClass(runMode === "pvalue")}
-                          type="button"
-                          onClick={() => setRunMode("pvalue")}
-                        >
-                          P-value
-                        </button>
-                        <button
-                          className={segmentClass(runMode === "score")}
-                          type="button"
-                          onClick={() => setRunMode("score")}
-                        >
-                          Score
-                        </button>
-                      </div>
-                    </div>
-
-                    {runMode === "pvalue" ? (
-                      <div>
-                        <label className="block text-sm font-medium text-stone-800" htmlFor="pvalue-input">
-                          P-value threshold
-                        </label>
-                        <input
-                          id="pvalue-input"
-                          className={`${CONTROL_CLASS} mt-2 font-mono`}
-                          value={pValueThreshold}
-                          onChange={(event) => setPValueThreshold(event.target.value)}
-                        />
-                      </div>
-                    ) : (
-                      <div>
-                        <label className="block text-sm font-medium text-stone-800" htmlFor="score-input">
-                          Integer score threshold
-                        </label>
-                        <input
-                          id="score-input"
-                          className={`${CONTROL_CLASS} mt-2 font-mono`}
-                          value={scoreThreshold}
-                          onChange={(event) => setScoreThreshold(event.target.value)}
-                          placeholder="120"
-                        />
-                      </div>
-                    )}
-
-                    <label className="flex items-center justify-between rounded-[8px] border border-stone-200 bg-white px-3 py-2">
-                      <span className="text-sm font-medium text-stone-800">Scan reverse complement</span>
-                      <input
-                        className="size-5 accent-emerald-700"
-                        type="checkbox"
-                        checked={scanReverseComplement}
-                        onChange={(event) => setScanReverseComplement(event.target.checked)}
-                      />
-                    </label>
-
-                    {(engineMode === "fimo" || engineMode === "both") ? (
-                      <div>
-                        <label className="block text-sm font-medium text-stone-800" htmlFor="fimo-pvalue-input">
-                          FIMO p-value threshold
-                        </label>
-                        <input
-                          id="fimo-pvalue-input"
-                          className={`${CONTROL_CLASS} mt-2 font-mono`}
-                          value={fimoPValueThreshold}
-                          onChange={(event) => setFimoPValueThreshold(event.target.value)}
-                        />
-                      </div>
-                    ) : null}
-                  </div>
-                ) : null}
+              <div className="mt-4">
+                <span className="block text-sm font-medium text-stone-800">Engine</span>
+                <div className="mt-2 grid grid-cols-3 gap-1 rounded-[8px] border border-stone-200 bg-stone-100 p-1">
+                  <button
+                    className={segmentClass(engineMode === "custom")}
+                    type="button"
+                    onClick={() => setEngineMode("custom")}
+                  >
+                    Custom
+                  </button>
+                  <button
+                    className={segmentClass(engineMode === "fimo")}
+                    type="button"
+                    onClick={() => setEngineMode("fimo")}
+                  >
+                    FIMO
+                  </button>
+                  <button
+                    className={segmentClass(engineMode === "both")}
+                    type="button"
+                    onClick={() => setEngineMode("both")}
+                  >
+                    Both
+                  </button>
+                </div>
               </div>
 
-              <Button className="mt-5 h-10 w-full bg-emerald-700 text-white hover:bg-emerald-800" disabled={isLoading}>
-                {isLoading ? <Loader2 className="size-4 animate-spin" /> : <Dna className="size-4" />}
-                {isLoading ? "Processing..." : "Start processing"}
-              </Button>
-            </div>
-          </section>
-        </form>
+              {engineMode !== "fimo" ? (
+                <div className="mt-4">
+                  <span className="block text-sm font-medium text-stone-800">Custom calibration</span>
+                  <div className="mt-2 grid grid-cols-2 gap-1 rounded-[8px] border border-stone-200 bg-stone-100 p-1">
+                    <button
+                      className={segmentClass(customCalibrationMode === "legacy")}
+                      type="button"
+                      onClick={() => setCustomCalibrationMode("legacy")}
+                    >
+                      Legacy
+                    </button>
+                    <button
+                      className={segmentClass(customCalibrationMode === "fimo_like")}
+                      type="button"
+                      onClick={() => setCustomCalibrationMode("fimo_like")}
+                    >
+                      FIMO-like
+                    </button>
+                  </div>
+                </div>
+              ) : null}
 
-        {isLoading ? (
-          <section className="mt-5 rounded-[10px] border border-stone-200 bg-white p-5 shadow-sm">
-            <p className="text-xs font-semibold uppercase text-emerald-700">Step 2</p>
-            <div className="mt-2 flex items-center gap-3 text-sm text-stone-700">
-              <Loader2 className="size-4 animate-spin text-emerald-700" />
-              Running PWM scan with current motif and FASTA.
-            </div>
+              {error ? (
+                <section className="mt-4 rounded-[8px] border border-rose-200 bg-rose-50 p-3 text-sm text-rose-900">
+                  {error}
+                </section>
+              ) : null}
+
+              <Button className="mt-5 h-10 w-full bg-emerald-700 text-white hover:bg-emerald-800">
+                <Dna className="size-4" />
+                Start processing
+              </Button>
+            </form>
           </section>
         ) : null}
 
-        {error ? (
-          <section className="mt-5 rounded-[10px] border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900">
-            {error}
+        {isLoading ? (
+          <section className="flex min-h-[78vh] items-center justify-center">
+            <div className="w-full max-w-md rounded-[10px] border border-stone-200 bg-white p-5 shadow-sm">
+              <div className="flex items-center gap-3 text-sm text-stone-800">
+                <Loader2 className="size-4 animate-spin text-emerald-700" />
+                Processing motif scan
+              </div>
+              <p className="mt-2 text-sm text-stone-600">Scoring motif windows across FASTA records.</p>
+              <div className="mt-4 h-2 overflow-hidden rounded-full bg-stone-200">
+                <div
+                  className="h-2 rounded-full bg-emerald-700 transition-[width] duration-500 ease-out"
+                  style={{ width: `${loadingProgress}%` }}
+                />
+              </div>
+              <p className="mt-2 text-right font-mono text-xs text-stone-600">{loadingProgress}%</p>
+            </div>
           </section>
         ) : null}
 
         {result ? (
-          <section className="mt-5 rounded-[10px] border border-stone-200 bg-white shadow-sm">
+          <section className="rounded-[10px] border border-stone-200 bg-white shadow-sm">
             <div className="border-b border-stone-200 p-4">
-              <p className="text-xs font-semibold uppercase text-emerald-700">Step 3</p>
               <div className="mt-1 flex flex-wrap items-center justify-between gap-3">
                 <h2 className="text-xl font-semibold">Results</h2>
                 <div className="flex gap-2">
+                  <Button className="bg-white" type="button" variant="outline" onClick={() => setResult(null)}>
+                    New scan
+                  </Button>
                   <Button className="bg-white" type="button" variant="outline" onClick={exportCsv}>
                     <FileSpreadsheet className="size-4" />
                     CSV
@@ -691,60 +642,11 @@ function App() {
   )
 }
 
-function StepIndicator({ currentStep }: { currentStep: 1 | 2 | 3 }) {
-  return (
-    <div className="grid gap-2 rounded-[10px] border border-stone-200 bg-white p-3 shadow-sm sm:grid-cols-3">
-      <StepNode index={1} active={currentStep === 1} done={currentStep > 1} label="Setup" />
-      <StepNode index={2} active={currentStep === 2} done={currentStep > 2} label="Processing" />
-      <StepNode index={3} active={currentStep === 3} done={false} label="Results" />
-    </div>
-  )
-}
-
-function StepNode({ index, active, done, label }: { index: number; active: boolean; done: boolean; label: string }) {
-  return (
-    <div
-      className={`flex items-center gap-2 rounded-[8px] border px-3 py-2 ${
-        active
-          ? "border-emerald-300 bg-emerald-50"
-          : done
-            ? "border-emerald-200 bg-white"
-            : "border-stone-200 bg-white"
-      }`}
-    >
-      <span
-        className={`flex size-6 items-center justify-center rounded-full text-xs font-semibold ${
-          done ? "bg-emerald-600 text-white" : active ? "bg-emerald-700 text-white" : "bg-stone-200 text-stone-700"
-        }`}
-      >
-        {done ? <CheckCircle2 className="size-3.5" /> : index}
-      </span>
-      <span className={`text-sm font-medium ${active ? "text-emerald-800" : "text-stone-700"}`}>{label}</span>
-    </div>
-  )
-}
-
 function MetricCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-[8px] border border-stone-200 bg-stone-50 p-3">
       <p className="text-xs font-medium uppercase text-stone-500">{label}</p>
       <p className="mt-1 text-xl font-semibold text-stone-900">{value}</p>
-    </div>
-  )
-}
-
-function FastaProfilePanel({ profile }: { profile: FastaProfile }) {
-  return (
-    <div className="mt-4 rounded-[8px] border border-stone-200 bg-stone-50 p-3">
-      <p className="text-sm font-semibold text-stone-900">FASTA snapshot</p>
-      <dl className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
-        <StatLine label="File size" value={formatBytes(profile.sizeBytes)} />
-        <StatLine label="Records" value={formatInteger(profile.records)} />
-        <StatLine label="Total bases" value={formatInteger(profile.totalBases)} />
-        <StatLine label="Ambiguous bases" value={formatInteger(profile.ambiguousBases)} />
-        <StatLine label="GC ratio" value={formatPercent(profile.gcRatio)} />
-        <StatLine label="First header" value={profile.firstHeader || "-"} />
-      </dl>
     </div>
   )
 }
@@ -1014,7 +916,7 @@ function MatchesPanel({
       </div>
 
       <div className="mt-3 overflow-x-auto rounded-[8px] border border-stone-200">
-        <table className="min-w-[940px] w-full text-left text-sm">
+        <table className="min-w-[1120px] w-full text-left text-sm">
           <thead className="bg-stone-100 text-xs uppercase text-stone-600">
             <tr>
               <th className="px-3 py-3">Gene</th>
@@ -1024,6 +926,8 @@ function MatchesPanel({
               <th className="px-3 py-3">Score</th>
               <th className="px-3 py-3">P-value</th>
               <th className="px-3 py-3">-log10 p</th>
+              <th className="px-3 py-3">Q-value</th>
+              <th className="px-3 py-3">-log10 q</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-stone-200 bg-white">
@@ -1050,11 +954,13 @@ function MatchesPanel({
                 <td className="px-3 py-3 font-mono">{match.score}</td>
                 <td className="px-3 py-3 font-mono">{match.p_value}</td>
                 <td className="px-3 py-3 font-mono">{match.negLog10PValue?.toFixed(2) ?? "-"}</td>
+                <td className="px-3 py-3 font-mono">{match.q_value ?? "-"}</td>
+                <td className="px-3 py-3 font-mono">{match.negLog10QValue?.toFixed(2) ?? "-"}</td>
               </tr>
             ))}
             {!visibleMatches.length ? (
               <tr>
-                <td className="px-3 py-12 text-center text-sm text-stone-500" colSpan={7}>
+                <td className="px-3 py-12 text-center text-sm text-stone-500" colSpan={9}>
                   No motif hits for current filters.
                 </td>
               </tr>
@@ -1282,12 +1188,6 @@ function segmentClass(active: boolean) {
   return `h-8 rounded-[6px] text-sm font-medium transition ${
     active ? "bg-white text-emerald-800 shadow-sm" : "text-stone-600 hover:text-stone-950"
   }`
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
 function formatInteger(value: number) {

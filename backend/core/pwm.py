@@ -82,11 +82,19 @@ class PositionWeightMatrix:
         return np.array(columns).T
 
     @classmethod
-    def build_integer_pwm(cls, pfm: np.ndarray, bg_freqs: Dict[str, float]) -> np.ndarray:
-        B = np.array([bg_freqs["A"], bg_freqs["C"], bg_freqs["G"], bg_freqs["T"]])
+    def build_integer_pwm(
+            cls,
+            pfm: np.ndarray,
+            bg_freqs: Dict[str, float],
+            pseudo_fraction: float = 0.0001,
+            lambda_scale: float = 100.0,
+    ) -> np.ndarray:
+        if pseudo_fraction < 0:
+            raise ValueError("pseudo_fraction deve ser >= 0.")
+        if lambda_scale <= 0:
+            raise ValueError("lambda_scale deve ser > 0.")
 
-        pseudo_fraction = 0.0001
-        lambda_scale = 100.0
+        B = np.array([bg_freqs["A"], bg_freqs["C"], bg_freqs["G"], bg_freqs["T"]])
 
         numerator = pfm + (pseudo_fraction * B[:, np.newaxis])
         denominator = B[:, np.newaxis] + (pseudo_fraction * B[:, np.newaxis])
@@ -95,6 +103,21 @@ class PositionWeightMatrix:
         integer_pwm = np.round(log_odds * lambda_scale).astype(np.int32)
 
         return integer_pwm
+
+    @classmethod
+    def build_log_odds_pwm(
+            cls,
+            pfm: np.ndarray,
+            bg_freqs: Dict[str, float],
+            pseudo_fraction: float = 0.0001,
+    ) -> np.ndarray:
+        if pseudo_fraction < 0:
+            raise ValueError("pseudo_fraction deve ser >= 0.")
+
+        B = np.array([bg_freqs["A"], bg_freqs["C"], bg_freqs["G"], bg_freqs["T"]], dtype=np.float64)
+        numerator = pfm + (pseudo_fraction * B[:, np.newaxis])
+        denominator = B[:, np.newaxis] + (pseudo_fraction * B[:, np.newaxis])
+        return np.log2(numerator / denominator)
 
     @classmethod
     def get_reverse_complement(cls, pwm: np.ndarray) -> np.ndarray:

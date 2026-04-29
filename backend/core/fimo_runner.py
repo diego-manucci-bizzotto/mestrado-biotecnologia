@@ -190,6 +190,8 @@ class FimoRunner:
                     "--text",
                     "--thresh",
                     str(p_value_threshold),
+                    "--motif-pseudo",
+                    "0.1",
                 ]
                 if not scan_reverse_complement:
                     command.append("--norc")
@@ -240,7 +242,7 @@ class FimoRunner:
                 if cp_fasta.returncode != 0:
                     raise RuntimeError(f"Falha ao copiar FASTA para container: {(cp_fasta.stderr or '').strip()}")
 
-                run_parts = ["fimo", "--text", "--thresh", str(p_value_threshold)]
+                run_parts = ["fimo", "--text", "--thresh", str(p_value_threshold), "--motif-pseudo", "0.1"]
                 if not scan_reverse_complement:
                     run_parts.append("--norc")
                 run_parts.extend([motif_container_path, fasta_container_path])

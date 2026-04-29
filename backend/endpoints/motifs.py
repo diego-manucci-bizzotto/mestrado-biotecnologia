@@ -13,6 +13,57 @@ from core.seq_scanner import SequenceScanner
 router = APIRouter()
 
 ENGINE_VALUES = {"custom", "fimo", "both"}
+CUSTOM_CALIBRATION_VALUES = {"legacy", "fimo_like"}
+
+# legacy: mantem o comportamento atual do projeto
+# fimo_like: aproxima a construcao de PWM do fluxo MEME/FIMO para motivo IUPAC com nsites=20
+CUSTOM_CALIBRATION_PRESETS = {
+    "legacy": {
+        "pseudo_fraction": 0.0001,
+        "lambda_scale": 100.0,
+        "score_mode": "integer",
+    },
+    "fimo_like": {
+        # FIMO usa pseudocount total padrao 0.1; para nsites=20 isso equivale a 0.1/20 = 0.005
+        "pseudo_fraction": 0.005,
+        "lambda_scale": 100.0,
+        "score_mode": "log_odds",
+    },
+}
+
+
+def _resolve_custom_calibration(mode: str) -> dict:
+    preset = CUSTOM_CALIBRATION_PRESETS.get(mode)
+    if not preset:
+        raise ValueError(f"custom_calibration_mode invalido: {mode}")
+    return preset
+
+
+def _attach_bh_q_values(matches: list[dict]) -> None:
+    if not matches:
+        return
+
+    m = len(matches)
+    ranked_indices = sorted(
+        range(m),
+        key=lambda idx: (matches[idx]["p_value_numeric"], -matches[idx]["score_log_odds"]),
+    )
+
+    q_values = [1.0] * m
+    running_min = 1.0
+
+    for rank in range(m, 0, -1):
+        idx = ranked_indices[rank - 1]
+        p_value = float(matches[idx]["p_value_numeric"])
+        adjusted = min(1.0, (p_value * m) / rank)
+        if adjusted < running_min:
+            running_min = adjusted
+        q_values[idx] = running_min
+
+    for idx, q_value in enumerate(q_values):
+        matches[idx]["q_value_numeric"] = q_value
+        matches[idx]["q_value"] = f"{q_value:.2e}"
+        matches[idx]["-log10_qval"] = round(-math.log10(q_value), 2) if q_value > 0 else None
 
 
 def _run_custom_scan(
@@ -22,9 +73,26 @@ def _run_custom_scan(
         p_value_threshold: float,
         score_threshold: Optional[int],
         scan_reverse_complement: bool,
+        custom_calibration_mode: str,
 ) -> tuple[dict, list[dict]]:
+    calibration = _resolve_custom_calibration(custom_calibration_mode)
+    pseudo_fraction = float(calibration["pseudo_fraction"])
+    lambda_scale = float(calibration["lambda_scale"])
+    score_mode = str(calibration["score_mode"])
+
     pfm = PositionWeightMatrix.parse_motif_pattern_to_pfm(motif_pattern)
-    pwm_fwd = PositionWeightMatrix.build_integer_pwm(pfm, bg_freqs)
+    pwm_log_fwd = PositionWeightMatrix.build_log_odds_pwm(
+        pfm,
+        bg_freqs,
+        pseudo_fraction=pseudo_fraction,
+    )
+    pwm_log_rev = PositionWeightMatrix.get_reverse_complement(pwm_log_fwd)
+    pwm_fwd = PositionWeightMatrix.build_integer_pwm(
+        pfm,
+        bg_freqs,
+        pseudo_fraction=pseudo_fraction,
+        lambda_scale=lambda_scale,
+    )
     pwm_rev = PositionWeightMatrix.get_reverse_complement(pwm_fwd)
     pcalc_fwd = PValueCalculator(pwm_fwd, bg_freqs)
     pcalc_rev = PValueCalculator(pwm_rev, bg_freqs)
@@ -41,16 +109,16 @@ def _run_custom_scan(
         cutoff_mode = "score"
         resolved_score_threshold = score_threshold
 
-    scan_configs = [("forward", "+", pwm_fwd, pcalc_fwd, cutoff_fwd)]
+    scan_configs = [("forward", "+", pwm_fwd, pwm_log_fwd, pcalc_fwd, cutoff_fwd)]
     if scan_reverse_complement:
-        scan_configs.append(("reverse", "-", pwm_rev, pcalc_rev, cutoff_rev))
+        scan_configs.append(("reverse", "-", pwm_rev, pwm_log_rev, pcalc_rev, cutoff_rev))
 
     matches: list[dict] = []
     for record in records:
         record_length = len(record.sequence)
         record_orientation = "reverse_complement" if record.is_reverse else "forward"
 
-        for strand_name, strand_symbol, pwm, pcalc, cutoff in scan_configs:
+        for strand_name, strand_symbol, pwm, pwm_log, pcalc, cutoff in scan_configs:
             hit_positions, hit_scores = SequenceScanner.scan_integer_matrix(
                 sequence=record.sequence,
                 pwm=pwm,
@@ -58,8 +126,8 @@ def _run_custom_scan(
             )
 
             for pos_idx, score_value in zip(hit_positions, hit_scores):
-                score = int(score_value)
-                p_value = float(pcalc.get_pvalue(score))
+                score_int = int(score_value)
+                p_value = float(pcalc.get_pvalue(score_int))
 
                 if score_threshold is None and p_value > p_value_threshold:
                     continue
@@ -85,6 +153,10 @@ def _run_custom_scan(
                 source_strand = "reverse" if source_strand_symbol == "-" else "forward"
                 neg_log10_pval = round(-math.log10(p_value), 2) if p_value > 0 else None
 
+                window_bases = [PositionWeightMatrix.BASE_TO_ID[base] for base in sequence_window]
+                score_log_odds = float(sum(pwm_log[base_id, col] for col, base_id in enumerate(window_bases)))
+                score_output = score_int if score_mode == "integer" else round(score_log_odds, 4)
+
                 matches.append({
                     "gene": record.gene_id,
                     "record_orientation": record_orientation,
@@ -97,13 +169,17 @@ def _run_custom_scan(
                     "end_position": end,
                     "source_position": source_start,
                     "source_end_position": source_end,
-                    "score": score,
+                    "score": score_output,
+                    "score_integer": score_int,
+                    "score_log_odds": round(score_log_odds, 4),
                     "p_value": f"{p_value:.2e}",
                     "p_value_numeric": p_value,
                     "-log10_pval": neg_log10_pval,
                 })
 
-    matches.sort(key=lambda item: (item["p_value_numeric"], -item["score"]))
+    matches.sort(key=lambda item: (item["p_value_numeric"], -item["score_log_odds"]))
+    _attach_bh_q_values(matches)
+
     metadata = {
         "motif_pattern": motif_pattern,
         "motif_length": motif_length,
@@ -111,6 +187,11 @@ def _run_custom_scan(
         "cutoff_mode": cutoff_mode,
         "background_frequencies": bg_freqs,
         "scan_reverse_complement": scan_reverse_complement,
+        "custom_calibration_mode": custom_calibration_mode,
+        "custom_pseudo_fraction": pseudo_fraction,
+        "custom_lambda_scale": lambda_scale,
+        "custom_score_mode": score_mode,
+        "qvalue_method": "BH",
     }
     return metadata, matches
 
@@ -162,6 +243,7 @@ async def find_motifs(
         scan_reverse_complement: bool = Form(True),
         engine: str = Form("custom"),
         fimo_p_value_threshold: float = Form(1e-4),
+        custom_calibration_mode: str = Form("legacy"),
 ):
     filename = file.filename or ""
     if not filename.endswith((".fasta", ".fa", ".fna")):
@@ -169,6 +251,12 @@ async def find_motifs(
 
     if engine not in ENGINE_VALUES:
         raise HTTPException(status_code=400, detail=f"engine invalido: {engine}")
+
+    if custom_calibration_mode not in CUSTOM_CALIBRATION_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"custom_calibration_mode invalido: {custom_calibration_mode}",
+        )
 
     if score_threshold is None and not 0 < p_value_threshold <= 1:
         raise HTTPException(
@@ -205,6 +293,7 @@ async def find_motifs(
                 p_value_threshold=p_value_threshold,
                 score_threshold=score_threshold,
                 scan_reverse_complement=scan_reverse_complement,
+                custom_calibration_mode=custom_calibration_mode,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Erro no scanner custom: {exc}") from exc
@@ -246,6 +335,7 @@ async def find_motifs(
                 "background_frequencies": bg_freqs,
                 "scan_reverse_complement": scan_reverse_complement,
                 "fimo_p_value_threshold": fimo_p_value_threshold,
+                "fimo_motif_pseudocount": 0.1,
             },
             "matches": fimo_matches or [],
         }
@@ -270,6 +360,7 @@ async def find_motifs(
                 "background_frequencies": bg_freqs,
                 "scan_reverse_complement": scan_reverse_complement,
                 "fimo_p_value_threshold": fimo_p_value_threshold,
+                "fimo_motif_pseudocount": 0.1,
             },
             "matches": fimo_matches or [],
         },
