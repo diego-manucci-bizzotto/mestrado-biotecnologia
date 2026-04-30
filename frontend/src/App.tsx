@@ -1,23 +1,11 @@
-import {
-  ArrowDownUp,
-  Dna,
-  FileJson,
-  FileSpreadsheet,
-  Filter,
-  Loader2,
-  Search,
-  UploadCloud,
-} from "lucide-react"
+import { ArrowDownUp, Dna, FileJson, FileSpreadsheet, Filter, Loader2, Search, UploadCloud } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
 import type { ChangeEvent, FormEvent } from "react"
 
 import { Button } from "@/components/ui/button"
 
 type Base = "A" | "C" | "G" | "T"
-type RunMode = "pvalue" | "score"
-type EngineMode = "custom" | "fimo" | "both"
-type CustomCalibrationMode = "legacy" | "fimo_like"
-type ViewTab = "overview" | "genes" | "matches" | "compare"
+type ViewTab = "overview" | "genes" | "matches"
 type SortMode = "pvalue" | "score" | "gene" | "position"
 type StrandFilter = "all" | "forward" | "reverse"
 
@@ -33,6 +21,18 @@ type FastaProfile = {
   firstHeader: string
 }
 
+type PValueEngineDiagnostics = {
+  method?: string
+  initial_granularity?: number
+  decreasing_step?: number
+  levels_used?: number
+  levels?: Array<{
+    epsilon: number
+    max_error: number
+    score_count: number
+  }>
+}
+
 type MotifMetadata = {
   filename: string
   motif_pattern: string
@@ -40,6 +40,10 @@ type MotifMetadata = {
   score_threshold: number | null
   cutoff_mode: string
   background_frequencies: Record<Base, number>
+  scan_reverse_complement?: boolean
+  custom_pseudo_fraction?: number
+  qvalue_method?: string
+  pvalue_engine?: PValueEngineDiagnostics
 }
 
 type RawMotifMatch = {
@@ -55,40 +59,17 @@ type RawMotifMatch = {
   source_position: number
   source_end_position: number
   score: number
+  score_log_odds?: number
   p_value: string
   p_value_numeric: number
   "-log10_pval": number | null
   q_value?: string
   q_value_numeric?: number
   "-log10_qval"?: number | null
-  score_integer?: number
-  score_log_odds?: number
-}
-
-type ApiPayload = {
-  metadata: MotifMetadata
-  matches: RawMotifMatch[]
-}
-
-type ComparisonStats = {
-  custom_total: number
-  fimo_total: number
-  overlap_total: number
-  only_custom_total: number
-  only_fimo_total: number
-  overlap_ratio_custom: number
-  overlap_ratio_fimo: number
-}
-
-type BothEnginesPayload = {
-  engine: "both"
-  custom: ApiPayload
-  fimo: ApiPayload
-  comparison: ComparisonStats
 }
 
 type SingleEnginePayload = {
-  engine?: "custom" | "fimo"
+  engine?: "custom"
   metadata: MotifMetadata
   matches: RawMotifMatch[]
 }
@@ -99,18 +80,8 @@ type MotifMatch = RawMotifMatch & {
 }
 
 type ScanResult = {
-  engine: EngineMode
   metadata: MotifMetadata
   matches: MotifMatch[]
-  custom?: {
-    metadata: MotifMetadata
-    matches: MotifMatch[]
-  }
-  fimo?: {
-    metadata: MotifMetadata
-    matches: MotifMatch[]
-  }
-  comparison?: ComparisonStats
   completedAt: string
 }
 
@@ -134,6 +105,7 @@ type GeneSummaryRow = {
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api").replace(/\/$/, "")
 const BASES: Base[] = ["A", "C", "G", "T"]
+const DEFAULT_P_VALUE_THRESHOLD = "1e-4"
 
 const IUPAC_CODES: Record<string, Base[]> = {
   A: ["A"],
@@ -167,34 +139,17 @@ function App() {
   const [file, setFile] = useState<File | null>(null)
   const [profile, setProfile] = useState<FastaProfile | null>(null)
   const [motifPattern, setMotifPattern] = useState("TATAWA")
-  const runMode: RunMode = "pvalue"
-  const [engineMode, setEngineMode] = useState<EngineMode>("custom")
-  const [customCalibrationMode, setCustomCalibrationMode] = useState<CustomCalibrationMode>("legacy")
-  const pValueThreshold = "1e-4"
-  const fimoPValueThreshold = "1e-4"
-  const scoreThreshold = ""
-  const scanReverseComplement = true
   const [isLoading, setIsLoading] = useState(false)
   const [loadingProgress, setLoadingProgress] = useState(0)
   const [error, setError] = useState("")
   const [result, setResult] = useState<ScanResult | null>(null)
   const [activeTab, setActiveTab] = useState<ViewTab>("overview")
-  const [activeDataset, setActiveDataset] = useState<"custom" | "fimo">("custom")
   const [searchTerm, setSearchTerm] = useState("")
   const [sortMode, setSortMode] = useState<SortMode>("pvalue")
   const [strandFilter, setStrandFilter] = useState<StrandFilter>("all")
 
   const motifColumns = useMemo(() => parseMotifPattern(motifPattern), [motifPattern])
-  const datasetView = useMemo(() => {
-    if (!result) return null
-    if (result.engine === "both") {
-      if (activeDataset === "fimo" && result.fimo) return result.fimo
-      if (result.custom) return result.custom
-    }
-    return { metadata: result.metadata, matches: result.matches }
-  }, [activeDataset, result])
-
-  const matches = useMemo(() => datasetView?.matches ?? [], [datasetView])
+  const matches = useMemo(() => result?.matches ?? [], [result])
   const stats = useMemo(() => calculateStats(matches), [matches])
   const geneSummary = useMemo(() => summarizeGenes(matches), [matches])
 
@@ -202,9 +157,7 @@ function App() {
     const query = searchTerm.trim().toLowerCase()
     const filtered = matches.filter((match) => {
       const passesSearch =
-        !query ||
-        match.gene.toLowerCase().includes(query) ||
-        match.matched_sequence.toLowerCase().includes(query)
+        !query || match.gene.toLowerCase().includes(query) || match.matched_sequence.toLowerCase().includes(query)
       const passesStrand = strandFilter === "all" || match.source_strand === strandFilter
       return passesSearch && passesStrand
     })
@@ -272,40 +225,17 @@ function App() {
       return
     }
 
-    if (runMode === "pvalue") {
-      const pValue = Number(pValueThreshold)
-      if (!Number.isFinite(pValue) || pValue <= 0 || pValue > 1) {
-        setError("P-value threshold must be > 0 and <= 1.")
-        return
-      }
-    } else {
-      const score = Number(scoreThreshold)
-      if (!Number.isInteger(score)) {
-        setError("Score threshold must be an integer.")
-        return
-      }
-    }
-
-    if (engineMode === "fimo" || engineMode === "both") {
-      const fimoThreshold = Number(fimoPValueThreshold)
-      if (!Number.isFinite(fimoThreshold) || fimoThreshold <= 0 || fimoThreshold > 1) {
-        setError("FIMO p-value threshold must be > 0 and <= 1.")
-        return
-      }
+    const pValue = Number(DEFAULT_P_VALUE_THRESHOLD)
+    if (!Number.isFinite(pValue) || pValue <= 0 || pValue > 1) {
+      setError("P-value threshold must be > 0 and <= 1.")
+      return
     }
 
     const formData = new FormData()
     formData.append("file", file)
     formData.append("motif_pattern", trimmedMotif)
-    formData.append("scan_reverse_complement", String(scanReverseComplement))
-    formData.append("engine", engineMode)
-    formData.append("fimo_p_value_threshold", fimoPValueThreshold)
-    formData.append("custom_calibration_mode", customCalibrationMode)
-    if (runMode === "pvalue") {
-      formData.append("p_value_threshold", pValueThreshold)
-    } else {
-      formData.append("score_threshold", scoreThreshold)
-    }
+    formData.append("scan_reverse_complement", "true")
+    formData.append("p_value_threshold", DEFAULT_P_VALUE_THRESHOLD)
 
     setIsLoading(true)
     setResult(null)
@@ -318,53 +248,21 @@ function App() {
       }
 
       const payload = parseScanResponse(raw)
-      const completedAt = new Date().toISOString()
+      const mappedMatches = payload.matches.map((match) => ({
+        ...match,
+        negLog10PValue: match["-log10_pval"],
+        negLog10QValue: match["-log10_qval"] ?? null,
+      }))
 
-      if (payload.engine === "both") {
-        const customMatches = payload.custom.matches.map((match) => ({
-          ...match,
-          negLog10PValue: match["-log10_pval"],
-          negLog10QValue: match["-log10_qval"] ?? null,
-        }))
-        const fimoMatches = payload.fimo.matches.map((match) => ({
-          ...match,
-          negLog10PValue: match["-log10_pval"],
-          negLog10QValue: match["-log10_qval"] ?? null,
-        }))
-
-        setResult({
-          engine: "both",
-          metadata: payload.custom.metadata,
-          matches: customMatches,
-          custom: {
-            metadata: payload.custom.metadata,
-            matches: customMatches,
-          },
-          fimo: {
-            metadata: payload.fimo.metadata,
-            matches: fimoMatches,
-          },
-          comparison: payload.comparison,
-          completedAt,
-        })
-        setActiveDataset("custom")
-        setActiveTab("compare")
-      } else {
-        const mappedMatches = payload.matches.map((match) => ({
-          ...match,
-          negLog10PValue: match["-log10_pval"],
-          negLog10QValue: match["-log10_qval"] ?? null,
-        }))
-
-        setResult({
-          engine: payload.engine ?? engineMode,
-          metadata: payload.metadata,
-          matches: mappedMatches,
-          completedAt,
-        })
-        setActiveDataset(payload.engine === "fimo" ? "fimo" : "custom")
-        setActiveTab("overview")
-      }
+      setResult({
+        metadata: payload.metadata,
+        matches: mappedMatches,
+        completedAt: new Date().toISOString(),
+      })
+      setActiveTab("overview")
+      setSearchTerm("")
+      setSortMode("pvalue")
+      setStrandFilter("all")
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "Scan failed.")
     } finally {
@@ -410,7 +308,7 @@ function App() {
       String(match.negLog10QValue ?? ""),
     ])
     downloadText(
-      `motif-matches-${safeTimestamp()}.csv`,
+      `motif-matches-custom-${safeTimestamp()}.csv`,
       [header, ...rows].map((row) => row.map(escapeCsv).join(",")).join("\n"),
       "text/csv",
     )
@@ -421,7 +319,10 @@ function App() {
       <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6">
         {!result && !isLoading ? (
           <section className="flex min-h-[78vh] items-center justify-center">
-            <form className="w-full max-w-2xl rounded-[10px] border border-stone-200 bg-white p-6 shadow-sm" onSubmit={handleSubmit}>
+            <form
+              className="w-full max-w-2xl rounded-[10px] border border-stone-200 bg-white p-6 shadow-sm"
+              onSubmit={handleSubmit}
+            >
               <div>
                 <label className="block text-sm font-medium text-stone-800" htmlFor="motif-pattern">
                   Motif pattern (IUPAC + optional [group])
@@ -455,55 +356,6 @@ function App() {
                   <span className="text-xs text-stone-600">Accepts .fasta .fa .fna</span>
                 </label>
               </div>
-
-              <div className="mt-4">
-                <span className="block text-sm font-medium text-stone-800">Engine</span>
-                <div className="mt-2 grid grid-cols-3 gap-1 rounded-[8px] border border-stone-200 bg-stone-100 p-1">
-                  <button
-                    className={segmentClass(engineMode === "custom")}
-                    type="button"
-                    onClick={() => setEngineMode("custom")}
-                  >
-                    Custom
-                  </button>
-                  <button
-                    className={segmentClass(engineMode === "fimo")}
-                    type="button"
-                    onClick={() => setEngineMode("fimo")}
-                  >
-                    FIMO
-                  </button>
-                  <button
-                    className={segmentClass(engineMode === "both")}
-                    type="button"
-                    onClick={() => setEngineMode("both")}
-                  >
-                    Both
-                  </button>
-                </div>
-              </div>
-
-              {engineMode !== "fimo" ? (
-                <div className="mt-4">
-                  <span className="block text-sm font-medium text-stone-800">Custom calibration</span>
-                  <div className="mt-2 grid grid-cols-2 gap-1 rounded-[8px] border border-stone-200 bg-stone-100 p-1">
-                    <button
-                      className={segmentClass(customCalibrationMode === "legacy")}
-                      type="button"
-                      onClick={() => setCustomCalibrationMode("legacy")}
-                    >
-                      Legacy
-                    </button>
-                    <button
-                      className={segmentClass(customCalibrationMode === "fimo_like")}
-                      type="button"
-                      onClick={() => setCustomCalibrationMode("fimo_like")}
-                    >
-                      FIMO-like
-                    </button>
-                  </div>
-                </div>
-              ) : null}
 
               {error ? (
                 <section className="mt-4 rounded-[8px] border border-rose-200 bg-rose-50 p-3 text-sm text-rose-900">
@@ -577,43 +429,12 @@ function App() {
                 <TabButton active={activeTab === "matches"} onClick={() => setActiveTab("matches")}>
                   Matches
                 </TabButton>
-                {result.engine === "both" ? (
-                  <TabButton active={activeTab === "compare"} onClick={() => setActiveTab("compare")}>
-                    Compare
-                  </TabButton>
-                ) : null}
               </div>
 
-              {result.engine === "both" ? (
-                <div className="mt-3 inline-flex rounded-[8px] border border-stone-200 bg-stone-100 p-1">
-                  <button
-                    className={segmentClass(activeDataset === "custom")}
-                    onClick={() => setActiveDataset("custom")}
-                    type="button"
-                  >
-                    Custom dataset
-                  </button>
-                  <button
-                    className={segmentClass(activeDataset === "fimo")}
-                    onClick={() => setActiveDataset("fimo")}
-                    type="button"
-                  >
-                    FIMO dataset
-                  </button>
-                </div>
+              {activeTab === "overview" ? (
+                <OverviewPanel metadata={result.metadata} profile={profile} stats={stats} completedAt={result.completedAt} />
               ) : null}
-
-              {activeTab === "overview" && datasetView ? (
-                <OverviewPanel
-                  metadata={datasetView.metadata}
-                  profile={profile}
-                  stats={stats}
-                  completedAt={result.completedAt}
-                />
-              ) : null}
-
               {activeTab === "genes" ? <GenesPanel rows={geneSummary} /> : null}
-
               {activeTab === "matches" ? (
                 <MatchesPanel
                   searchTerm={searchTerm}
@@ -626,14 +447,6 @@ function App() {
                   visibleMatches={visibleMatches}
                 />
               ) : null}
-
-              {activeTab === "compare" && result.engine === "both" && result.custom && result.fimo && result.comparison ? (
-                <ComparePanel
-                  comparison={result.comparison}
-                  customMatches={result.custom.matches}
-                  fimoMatches={result.fimo.matches}
-                />
-              ) : null}
             </div>
           </section>
         ) : null}
@@ -642,49 +455,41 @@ function App() {
   )
 }
 
-function MetricCard({ label, value }: { label: string; value: string }) {
+function MotifPreview({ columns, motifPattern }: { columns: Base[][]; motifPattern: string }) {
   return (
-    <div className="rounded-[8px] border border-stone-200 bg-stone-50 p-3">
-      <p className="text-xs font-medium uppercase text-stone-500">{label}</p>
-      <p className="mt-1 text-xl font-semibold text-stone-900">{value}</p>
+    <div className="mt-3 rounded-[8px] border border-stone-200 bg-stone-50 p-3">
+      <p className="text-xs font-medium text-stone-600">Motif bases preview</p>
+      {columns.length ? (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {columns.map((column, idx) => (
+            <div className="rounded-[8px] border border-stone-200 bg-white px-2 py-2" key={`${motifPattern}-${idx}`}>
+              <p className="text-center font-mono text-[10px] text-stone-500">{idx + 1}</p>
+              <div className="mt-1 flex gap-1">
+                {column.map((base) => (
+                  <span
+                    className={`flex size-6 items-center justify-center rounded-[6px] border text-xs font-bold ${BASE_SWATCHES[base]}`}
+                    key={`${idx}-${base}`}
+                  >
+                    {base}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-2 text-sm text-rose-700">Invalid motif pattern.</p>
+      )}
     </div>
   )
 }
 
-function MotifPreview({ columns, motifPattern }: { columns: Base[][]; motifPattern: string }) {
-  if (!motifPattern.trim()) {
-    return <p className="mt-3 text-sm text-stone-500">Type a motif to see base composition.</p>
-  }
-
-  if (!columns.length) {
-    return <p className="mt-3 text-sm text-rose-700">Invalid motif pattern.</p>
-  }
-
+function MetricCard({ label, value }: { label: string; value: string }) {
   return (
-    <div className="mt-3 overflow-x-auto rounded-[8px] border border-stone-200 bg-stone-50 p-3">
-      <div className="flex min-w-fit gap-2">
-        {columns.map((column, index) => (
-          <div className="w-[66px] rounded-[8px] border border-stone-200 bg-white p-2" key={`${index}-${column.join("")}`}>
-            <p className="text-center text-[10px] font-semibold uppercase text-stone-500">pos {index + 1}</p>
-            <div className="mt-2 space-y-1">
-              {BASES.map((base) => {
-                const probability = column.includes(base) ? 1 / column.length : 0
-                return (
-                  <div className="grid grid-cols-[14px_minmax(0,1fr)] items-center gap-1" key={base}>
-                    <span className={`rounded-[4px] border text-center text-[10px] font-bold ${BASE_SWATCHES[base]}`}>
-                      {base}
-                    </span>
-                    <div className="h-2 rounded-full bg-stone-100">
-                      <div className="h-2 rounded-full bg-emerald-600" style={{ width: `${probability * 100}%` }} />
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
+    <article className="rounded-[8px] border border-stone-200 bg-white p-3">
+      <p className="text-xs font-medium uppercase text-stone-600">{label}</p>
+      <p className="mt-1 font-mono text-lg font-semibold text-stone-950">{value}</p>
+    </article>
   )
 }
 
@@ -712,10 +517,19 @@ function OverviewPanel({
             label="Score threshold"
             value={metadata.score_threshold === null ? "derived from p-value" : String(metadata.score_threshold)}
           />
+          <StatLine label="P-value threshold" value={DEFAULT_P_VALUE_THRESHOLD} />
           <StatLine label="Completed at" value={new Date(completedAt).toLocaleString()} />
-          <StatLine label="Forward strand hits" value={formatInteger(stats.forwardSource)} />
-          <StatLine label="Reverse strand hits" value={formatInteger(stats.reverseSource)} />
+          <StatLine label="Forward source hits" value={formatInteger(stats.forwardSource)} />
+          <StatLine label="Reverse source hits" value={formatInteger(stats.reverseSource)} />
           <StatLine label="Canonical bases in file" value={profile ? formatInteger(profile.canonicalBases) : "-"} />
+          <StatLine
+            label="P-value method"
+            value={metadata.pvalue_engine?.method ?? "discretized distribution"}
+          />
+          <StatLine
+            label="Granularity levels"
+            value={String(metadata.pvalue_engine?.levels_used ?? "-")}
+          />
         </dl>
       </div>
 
@@ -724,7 +538,9 @@ function OverviewPanel({
         <div className="mt-3 space-y-3">
           {BASES.map((base) => (
             <div className="grid grid-cols-[24px_minmax(0,1fr)_50px] items-center gap-2" key={base}>
-              <span className={`flex size-6 items-center justify-center rounded-[6px] border text-xs font-bold ${BASE_SWATCHES[base]}`}>
+              <span
+                className={`flex size-6 items-center justify-center rounded-[6px] border text-xs font-bold ${BASE_SWATCHES[base]}`}
+              >
                 {base}
               </span>
               <div className="h-2 rounded-full bg-stone-200">
@@ -778,81 +594,6 @@ function GenesPanel({ rows }: { rows: GeneSummaryRow[] }) {
           ) : null}
         </tbody>
       </table>
-    </div>
-  )
-}
-
-function ComparePanel({
-  comparison,
-  customMatches,
-  fimoMatches,
-}: {
-  comparison: ComparisonStats
-  customMatches: MotifMatch[]
-  fimoMatches: MotifMatch[]
-}) {
-  const customBest = customMatches.length
-    ? [...customMatches].sort((a, b) => a.p_value_numeric - b.p_value_numeric)[0]
-    : null
-  const fimoBest = fimoMatches.length
-    ? [...fimoMatches].sort((a, b) => a.p_value_numeric - b.p_value_numeric)[0]
-    : null
-
-  return (
-    <div className="mt-4 grid gap-4 lg:grid-cols-2">
-      <div className="rounded-[8px] border border-stone-200 bg-white p-4">
-        <h3 className="text-sm font-semibold text-stone-900">Overlap summary</h3>
-        <dl className="mt-3 space-y-2 text-sm">
-          <StatLine label="Custom total" value={formatInteger(comparison.custom_total)} />
-          <StatLine label="FIMO total" value={formatInteger(comparison.fimo_total)} />
-          <StatLine label="Shared hits" value={formatInteger(comparison.overlap_total)} />
-          <StatLine label="Only custom" value={formatInteger(comparison.only_custom_total)} />
-          <StatLine label="Only FIMO" value={formatInteger(comparison.only_fimo_total)} />
-          <StatLine label="Custom overlap ratio" value={formatPercent(comparison.overlap_ratio_custom)} />
-          <StatLine label="FIMO overlap ratio" value={formatPercent(comparison.overlap_ratio_fimo)} />
-        </dl>
-      </div>
-
-      <div className="rounded-[8px] border border-stone-200 bg-stone-50 p-4">
-        <h3 className="text-sm font-semibold text-stone-900">Best hit by engine</h3>
-        <div className="mt-3 grid gap-3">
-          <EngineBestHit
-            title="Custom"
-            gene={customBest?.gene ?? "-"}
-            pValue={customBest ? formatPValue(customBest.p_value_numeric) : "-"}
-            score={customBest ? String(customBest.score) : "-"}
-          />
-          <EngineBestHit
-            title="FIMO"
-            gene={fimoBest?.gene ?? "-"}
-            pValue={fimoBest ? formatPValue(fimoBest.p_value_numeric) : "-"}
-            score={fimoBest ? String(fimoBest.score) : "-"}
-          />
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function EngineBestHit({
-  title,
-  gene,
-  pValue,
-  score,
-}: {
-  title: string
-  gene: string
-  pValue: string
-  score: string
-}) {
-  return (
-    <div className="rounded-[8px] border border-stone-200 bg-white p-3">
-      <p className="text-xs font-semibold uppercase text-stone-600">{title}</p>
-      <dl className="mt-2 space-y-1 text-sm">
-        <StatLine label="Gene" value={gene} />
-        <StatLine label="Best p-value" value={pValue} />
-        <StatLine label="Score" value={score} />
-      </dl>
     </div>
   )
 }
@@ -1152,24 +893,15 @@ function sortMatches(a: MotifMatch, b: MotifMatch, sortMode: SortMode) {
   return a.p_value_numeric - b.p_value_numeric || b.score - a.score
 }
 
-function parseScanResponse(raw: string): SingleEnginePayload | BothEnginesPayload {
+function parseScanResponse(raw: string): SingleEnginePayload {
   const trimmed = raw.trim()
   if (!trimmed) throw new Error("API returned an empty response.")
 
   try {
-    return JSON.parse(trimmed) as SingleEnginePayload | BothEnginesPayload
+    return JSON.parse(trimmed) as SingleEnginePayload
   } catch {
-    const payloads = trimmed
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as SingleEnginePayload | BothEnginesPayload)
-    const payload = payloads.find((candidate) =>
-      "engine" in candidate
-        ? candidate.engine === "both"
-          ? Boolean(candidate.custom && candidate.fimo)
-          : Boolean((candidate as SingleEnginePayload).metadata && (candidate as SingleEnginePayload).matches)
-        : Boolean((candidate as SingleEnginePayload).metadata && (candidate as SingleEnginePayload).matches),
-    )
+    const payloads = trimmed.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as SingleEnginePayload)
+    const payload = payloads.find((candidate) => Boolean(candidate.metadata && candidate.matches))
     if (!payload) throw new Error("Could not parse API response.")
     return payload
   }
@@ -1182,12 +914,6 @@ function readApiError(raw: string) {
   } catch {
     return raw || "API rejected scan request."
   }
-}
-
-function segmentClass(active: boolean) {
-  return `h-8 rounded-[6px] text-sm font-medium transition ${
-    active ? "bg-white text-emerald-800 shadow-sm" : "text-stone-600 hover:text-stone-950"
-  }`
 }
 
 function formatInteger(value: number) {
