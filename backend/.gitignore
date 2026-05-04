@@ -1,2 +1,5 @@
 *.iml
+__pycache__/
+*.py[cod]
+*.log
 

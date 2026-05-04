@@ -191,7 +191,8 @@ class PValueCalculator:
 
     def _build_diagnostics(self) -> dict:
         return {
-            "method": "touzet_varre_2007_discretized_dp",
+            "method": "custom_discretized_dp",
+            "reference": "touzet_varre_2007",
             "initial_granularity": self._initial_granularity,
             "decreasing_step": self._decreasing_step,
             "max_refinement_steps": self._max_refinement_steps,
