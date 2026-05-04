@@ -1,8 +1,12 @@
+import json
 import math
+import queue
+import threading
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from starlette.responses import StreamingResponse
 
 from core.bg_freqs import BackgroundFrequencies
 from core.fasta_reader import FastaReader, FastaRecord
@@ -12,6 +16,8 @@ from core.pwm import PositionWeightMatrix
 from core.seq_scanner import SequenceScanner
 
 router = APIRouter()
+
+ProgressCallback = Callable[[int, str], None]
 
 FASTA_EXTENSIONS = (".fasta", ".fa", ".fna")
 
@@ -115,6 +121,93 @@ async def find_motifs(
     }
 
 
+@router.post("/stream", status_code=200)
+async def find_motifs_stream(
+    file: UploadFile = File(...),
+    motif_pattern: str = Form(..., description="IUPAC motif pattern with optional bracket groups"),
+    p_value_threshold: float = Form(
+        1e-4,
+        description="Maximum p-value to report when score_threshold is not supplied.",
+    ),
+    score_threshold: Optional[float] = Form(
+        None,
+        description="Optional direct PWM log2-odds score cutoff. If supplied, p_value_threshold is not used as the cutoff.",
+    ),
+    scan_reverse_complement: bool = Form(
+        True,
+        description="Scan both forward and reverse-complement motif orientations.",
+    ),
+):
+    filename = file.filename or ""
+    _validate_request(filename, p_value_threshold, score_threshold)
+    fasta_text = await _read_fasta_text(file)
+    motif = motif_pattern.strip().upper()
+
+    def stream_events():
+        events = queue.Queue()
+        finished = object()
+
+        def emit_progress(progress: int, stage: str) -> None:
+            events.put(
+                {
+                    "type": "progress",
+                    "progress": max(0, min(100, int(progress))),
+                    "stage": stage,
+                }
+            )
+
+        def emit_event(payload: dict) -> None:
+            events.put(payload)
+
+        def worker() -> None:
+            try:
+                emit_progress(2, "Reading FASTA")
+                records = FastaReader.parse_text(fasta_text)
+                if not records:
+                    raise ValueError("Nenhum registro FASTA valido encontrado.")
+
+                emit_progress(8, "Estimating FASTA background")
+                background_frequencies = BackgroundFrequencies.calculate_from_text(fasta_text)
+
+                metadata, matches = _scan_records(
+                    records=records,
+                    motif_pattern=motif,
+                    background_frequencies=background_frequencies,
+                    p_value_threshold=p_value_threshold,
+                    score_threshold=score_threshold,
+                    scan_reverse_complement=scan_reverse_complement,
+                    progress_callback=emit_progress,
+                )
+                emit_progress(100, "Scan complete")
+                emit_event(
+                    {
+                        "type": "result",
+                        "payload": {
+                            "engine": "custom",
+                            "metadata": {
+                                "filename": filename,
+                                **metadata,
+                            },
+                            "matches": matches,
+                        },
+                    }
+                )
+            except Exception as exc:
+                emit_event({"type": "error", "message": f"Erro no scanner de motivos: {exc}"})
+            finally:
+                events.put(finished)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            event = events.get()
+            if event is finished:
+                break
+            yield f"{json.dumps(event, ensure_ascii=False)}\n"
+
+    return StreamingResponse(stream_events(), media_type="application/x-ndjson")
+
+
 def _validate_request(
     filename: str,
     p_value_threshold: float,
@@ -125,6 +218,18 @@ def _validate_request(
 
     if score_threshold is None and not 0 < p_value_threshold <= 1:
         raise HTTPException(status_code=400, detail="p_value_threshold deve estar no intervalo (0, 1].")
+
+
+def _emit_progress(callback: Optional[ProgressCallback], progress: int, stage: str) -> None:
+    if callback is not None:
+        callback(progress, stage)
+
+
+def _scaled_progress(completed: int, total: int, start: int, end: int) -> int:
+    if total <= 0:
+        return end
+    ratio = max(0.0, min(1.0, completed / total))
+    return start + round((end - start) * ratio)
 
 
 async def _read_fasta_text(file: UploadFile) -> str:
@@ -143,6 +248,7 @@ def _scan_records(
     p_value_threshold: float,
     score_threshold: Optional[float],
     scan_reverse_complement: bool,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> tuple[dict, list[dict]]:
     return _scan_records_custom(
         records=records,
@@ -151,6 +257,7 @@ def _scan_records(
         p_value_threshold=p_value_threshold,
         score_threshold=score_threshold,
         scan_reverse_complement=scan_reverse_complement,
+        progress_callback=progress_callback,
     )
 
 
@@ -162,11 +269,18 @@ def _scan_records_custom(
     p_value_threshold: float,
     score_threshold: Optional[float],
     scan_reverse_complement: bool,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> tuple[dict, list[dict]]:
     # Step 1: Build motif models and p-value engines in float + integer spaces.
-    models = _build_models(motif_pattern=motif_pattern, background_frequencies=background_frequencies)
+    _emit_progress(progress_callback, 12, "Building PWM model")
+    models = _build_models(
+        motif_pattern=motif_pattern,
+        background_frequencies=background_frequencies,
+        progress_callback=progress_callback,
+    )
 
     # Step 2: Resolve strand-specific cutoffs and scan configuration.
+    _emit_progress(progress_callback, 22, "Resolving statistical cutoff")
     scan_configs, cutoff_mode, reported_score_threshold = _build_scan_configs(
         models=models,
         p_value_threshold=p_value_threshold,
@@ -182,6 +296,9 @@ def _scan_records_custom(
             models=models,
             p_value_threshold=p_value_threshold,
             scan_reverse_complement=scan_reverse_complement,
+            progress_callback=progress_callback,
+            progress_start=28,
+            progress_end=55,
         )
 
     # Step 4: Scan all records and project hits back to source-space coordinates.
@@ -192,9 +309,13 @@ def _scan_records_custom(
         p_value_threshold=p_value_threshold,
         score_threshold=score_threshold,
         boundary_accept_keys=boundary_accept_keys,
+        progress_callback=progress_callback,
+        progress_start=55 if score_threshold is None else 28,
+        progress_end=94,
     )
 
     # Step 5: Sort and build response metadata.
+    _emit_progress(progress_callback, 97, "Sorting hits")
     matches.sort(key=lambda item: (item["p_value_numeric"], -_score_for_rank(item)))
     metadata = _build_metadata(
         motif_pattern=motif_pattern,
@@ -212,6 +333,7 @@ def _build_models(
     *,
     motif_pattern: str,
     background_frequencies: dict[str, float],
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> ModelBundle:
     pfm = PositionWeightMatrix.parse_motif_pattern_to_pfm(motif_pattern)
     pwm_forward_float = PositionWeightMatrix.build_log_odds_pwm(
@@ -229,9 +351,13 @@ def _build_models(
     )
     pwm_reverse_int = PositionWeightMatrix.get_reverse_complement(pwm_forward_int)
 
+    _emit_progress(progress_callback, 14, "Building forward score distribution")
     pcalc_forward_float = _new_pvalue_calculator(pwm_forward_float, background_frequencies)
+    _emit_progress(progress_callback, 16, "Building reverse score distribution")
     pcalc_reverse_float = _new_pvalue_calculator(pwm_reverse_float, background_frequencies)
+    _emit_progress(progress_callback, 18, "Building exact integer distribution")
     pcalc_forward_int = _new_integer_pvalue_calculator(pwm_forward_int, background_frequencies)
+    _emit_progress(progress_callback, 20, "Building reverse integer distribution")
     pcalc_reverse_int = _new_integer_pvalue_calculator(pwm_reverse_int, background_frequencies)
 
     return ModelBundle(
@@ -297,6 +423,9 @@ def _collect_boundary_accept_keys(
     models: ModelBundle,
     p_value_threshold: float,
     scan_reverse_complement: bool,
+    progress_callback: Optional[ProgressCallback] = None,
+    progress_start: int = 0,
+    progress_end: int = 100,
 ) -> set[tuple[str, str, int, int]]:
     cutoff_forward = int(models.pcalc_forward_int.get_score_threshold_for_pvalue(p_value_threshold))
     cutoff_reverse = int(models.pcalc_reverse_int.get_score_threshold_for_pvalue(p_value_threshold))
@@ -308,6 +437,12 @@ def _collect_boundary_accept_keys(
         int_scan_configs.append(("-", models.pwm_reverse_int, models.pcalc_reverse_int, cutoff_reverse))
 
     accept_keys: set[tuple[str, str, int, int]] = set()
+    total_units = max(
+        1,
+        sum(_record_scan_units(record, models.motif_length, len(int_scan_configs)) for record in records),
+    )
+    completed_units = 0
+    last_progress = -1
     for record in records:
         for strand_symbol, pwm_int, pcalc_int, cutoff in int_scan_configs:
             hit_positions, hit_scores = SequenceScanner.scan_integer_matrix(
@@ -323,6 +458,12 @@ def _collect_boundary_accept_keys(
                 scan_end = scan_start + models.motif_length - 1
                 accept_keys.add((record.gene_id, strand_symbol, scan_start, scan_end))
 
+        completed_units += _record_scan_units(record, models.motif_length, len(int_scan_configs))
+        progress = _scaled_progress(completed_units, total_units, progress_start, progress_end)
+        if progress != last_progress:
+            _emit_progress(progress_callback, progress, "Reconciling p-value boundary hits")
+            last_progress = progress
+
     return accept_keys
 
 
@@ -334,8 +475,17 @@ def _scan_all_records(
     p_value_threshold: float,
     score_threshold: Optional[float],
     boundary_accept_keys: Optional[set[tuple[str, str, int, int]]],
+    progress_callback: Optional[ProgressCallback] = None,
+    progress_start: int = 0,
+    progress_end: int = 100,
 ) -> list[dict]:
     matches: list[dict] = []
+    total_units = max(
+        1,
+        sum(_record_scan_units(record, motif_length, len(scan_configs)) for record in records),
+    )
+    completed_units = 0
+    last_progress = -1
     for record in records:
         matches.extend(
             _scan_one_record_custom(
@@ -347,7 +497,16 @@ def _scan_all_records(
                 boundary_accept_keys=boundary_accept_keys,
             )
         )
+        completed_units += _record_scan_units(record, motif_length, len(scan_configs))
+        progress = _scaled_progress(completed_units, total_units, progress_start, progress_end)
+        if progress != last_progress:
+            _emit_progress(progress_callback, progress, "Scanning FASTA records")
+            last_progress = progress
     return matches
+
+
+def _record_scan_units(record: FastaRecord, motif_length: int, strand_count: int) -> int:
+    return max(0, len(record.sequence) - motif_length + 1) * max(1, strand_count)
 
 
 def _build_metadata(

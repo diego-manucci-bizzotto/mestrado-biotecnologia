@@ -49,23 +49,23 @@
 }
 
 :root {
-    --background: oklch(0.985 0.012 145);
-    --foreground: oklch(0.16 0.015 70);
+    --background: oklch(0.985 0.018 150);
+    --foreground: oklch(0.16 0.02 150);
     --card: oklch(1 0 0);
     --card-foreground: oklch(0.16 0.015 70);
     --popover: oklch(1 0 0);
     --popover-foreground: oklch(0.16 0.015 70);
     --primary: oklch(0.45 0.13 158);
     --primary-foreground: oklch(0.99 0.01 145);
-    --secondary: oklch(0.955 0.025 205);
-    --secondary-foreground: oklch(0.23 0.04 220);
-    --muted: oklch(0.955 0.01 95);
-    --muted-foreground: oklch(0.48 0.02 70);
-    --accent: oklch(0.94 0.07 86);
-    --accent-foreground: oklch(0.25 0.04 70);
+    --secondary: oklch(0.95 0.03 155);
+    --secondary-foreground: oklch(0.22 0.06 155);
+    --muted: oklch(0.955 0.018 150);
+    --muted-foreground: oklch(0.46 0.035 150);
+    --accent: oklch(0.93 0.055 145);
+    --accent-foreground: oklch(0.23 0.06 150);
     --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.89 0.01 85);
-    --input: oklch(0.89 0.01 85);
+    --border: oklch(0.88 0.025 150);
+    --input: oklch(0.88 0.025 150);
     --ring: oklch(0.55 0.12 158);
     --chart-1: oklch(0.56 0.14 158);
     --chart-2: oklch(0.57 0.12 236);
@@ -118,25 +118,35 @@
 }
 
 @layer base {
-  * {
-    @apply border-border outline-ring/50;
+    * {
+        @apply border-border outline-ring/50;
     }
-  body {
-    @apply bg-background text-foreground antialiased;
+
+    body {
+        @apply bg-background text-foreground antialiased;
     }
-  html {
-    @apply font-sans;
+
+    html {
+        @apply font-sans;
     }
-  #root {
-    min-height: 100vh;
+
+    #root {
+        min-height: 100vh;
     }
-  button,
-  input,
-  textarea,
-  select {
-    font: inherit;
+
+    button,
+    input,
+    textarea,
+    select {
+        font: inherit;
     }
-  ::selection {
-    background: color-mix(in oklch, var(--primary) 24%, white);
+
+    ::selection {
+        background: color-mix(in oklch, var(--primary) 24%, white);
+    }
+
+    button:not(:disabled),
+    [role="button"]:not(:disabled) {
+        cursor: pointer;
     }
 }
