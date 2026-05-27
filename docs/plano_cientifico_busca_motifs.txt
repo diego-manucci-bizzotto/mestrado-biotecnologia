@@ -1,0 +1,40 @@
+Plano cientifico para busca de motifs regulatorios
+
+Objetivo
+Desenvolver uma ferramenta para triagem e priorizacao estatistica de motifs em regioes promotoras de fungos, com backend FastAPI, frontend React TS/Vite e relatorios auditaveis.
+
+Etapa 1 - Catalogo de motifs
+Metodo: cadastrar motifs com fator regulador, consenso IUPAC, PWM quando disponivel, reverso-complementar e fonte bibliografica.
+Apoio cientifico:
+- StuA: Petrucelli et al. 2024 usaram regioes upstream de 1 kb e consenso 5'-[A/T]CGCG[T/A]N[A/C]-3' para identificar elementos StuA em T. rubrum. URL: https://www.mdpi.com/1422-0067/25/23/12959
+- PacC/PAC-3: Martins et al. 2019 usaram regioes upstream de 1 kb e consenso 5'-GCCARG-3'. URL: https://www.frontiersin.org/journals/microbiology/articles/10.3389/fmicb.2019.02076/full
+- Crz/Crz1: Thewes 2014 revisa vias calcineurina/CrzA e elementos responsivos em fungos. URL: https://pmc.ncbi.nlm.nih.gov/articles/PMC4054267/
+
+Etapa 2 - Match exato IUPAC
+Metodo: buscar todas as janelas que obedecem ao consenso IUPAC nas fitas direta e reverso-complementar.
+Apoio cientifico: os estudos de StuA e PacC acima usam scripts ad hoc baseados em consenso como triagem in silico.
+Limitacao: match exato identifica candidatos, mas nao prova ligacao funcional; motifs curtos podem aparecer ao acaso.
+
+Etapa 3 - PWM
+Metodo: usar PWM real quando disponivel. Quando nao houver matriz experimental, converter o consenso IUPAC em PWM derivada, rotulando essa origem no relatorio.
+Apoio cientifico: FIMO usa matrizes position-specific para escanear sequencias e ranquear ocorrencias por score, p-value e q-value. URL: https://academic.oup.com/bioinformatics/article/27/7/1017/232614
+Limitacao: PWM derivada de consenso e menos forte do que PWM experimental obtida por PBM, ChIP-seq, SELEX ou base curada.
+
+Etapa 4 - P-value
+Metodo: calcular p-value por janela a partir do fundo A/C/G/T do FASTA. No match exato, o p-value local e a probabilidade do consenso ocorrer em uma janela aleatoria. No PWM, o p-value e a probabilidade de uma janela aleatoria atingir score igual ou maior.
+Apoio cientifico: FIMO converte scores de motif para p-values assumindo modelo nulo de fundo de sequencia. URL: https://meme-suite.org/meme/doc/fimo.html?man_type=web
+
+Etapa 5 - Q-value e multiplos testes
+Metodo: aplicar Benjamini-Hochberg/FDR aos p-values, incluindo todas as janelas, fitas e motifs avaliados no experimento.
+Apoio cientifico: MEME Suite qvalue calcula q-values com o metodo de Benjamini-Hochberg. URL: https://meme-suite.org/meme/doc/qvalue.html
+
+Etapa 6 - Enriquecimento
+Metodo: comparar hits observados contra hits esperados pelo fundo de bases e numero de janelas; reportar p-value de enriquecimento e q-value.
+Apoio cientifico: em varreduras de motifs, presenca isolada e fraca; enriquecimento e controle de falso positivo tornam a triagem mais defensavel.
+
+Etapa 7 - Validacao biologica
+Metodo: priorizar candidatos com q-value significativo, conservacao entre especies, posicao plausivel no promotor, funcao compativel e evidencia de expressao quando disponivel.
+Apoio cientifico: os trabalhos de StuA e PacC combinam motif em promotor com interpretacao funcional e dados biologicos adicionais.
+
+Decisao para a primeira versao
+O sistema nasce hibrido: match exato IUPAC como baseline reprodutivel e PWM como modo principal de ranqueamento. O relatorio deve deixar claro se a PWM veio de consenso derivado ou de matriz experimental.

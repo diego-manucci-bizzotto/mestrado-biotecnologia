@@ -1,0 +1,147 @@
+PWM-Only Cutover + Enrichment Model Fix
+Date: 2026-05-26
+
+======================================================================
+1) OLD VS NEW API CONTRACT
+======================================================================
+
+OLD (POST /api/analyses):
+- file
+- motif
+- motif_name (optional)
+- scan_mode (iupac_exact | pwm | both)
+- p_value_cutoff
+
+NEW (POST /api/analyses):
+- file
+- motif
+- p_value_cutoff
+
+Breaking changes:
+- Removed motif_name and scan_mode from supported request fields.
+- Backend now strictly rejects deprecated/unknown fields with HTTP 400.
+
+Rationale:
+- Runtime is now PWM-only. Keeping mode/name fields would imply unsupported behavior.
+
+======================================================================
+2) OLD VS NEW ENRICHMENT FORMULA
+======================================================================
+
+OLD expected hits:
+- expected_hits = total_windows * probability_for_iupac(motif, background)
+
+NEW expected hits (PWM-threshold consistent):
+- expected_hits = total_windows * p_value_cutoff
+
+Unchanged global test:
+- enrichment_p_value = P(X >= observed_hits), with X ~ Poisson(expected_hits)
+
+Current enrichment q-value behavior:
+- BH applied to one enrichment p-value in the current analysis family.
+- Practical consequence: enrichment_q_value can equal enrichment_p_value.
+
+======================================================================
+3) SCIENTIFIC RATIONALE
+======================================================================
+
+Problem in old setup:
+- Hits were selected by PWM p-value threshold, but global expectation came from
+  an IUPAC probability model.
+- This mismatch made global enrichment hard to interpret and biased toward weak signal,
+  especially for short/degenerate motifs.
+
+Why new setup is better:
+- Selection rule and expectation now share the same null-rate basis (the thresholded PWM criterion).
+- Global enrichment interpretation is internally coherent:
+  observed PWM-threshold hits vs expected PWM-threshold hits.
+
+======================================================================
+4) RESPONSE TRANSPARENCY FIELDS ADDED
+======================================================================
+
+Analysis summary now includes:
+- expected_hit_rate
+- enrichment_test_count
+- enrichment_model = "poisson_pwm_threshold"
+
+Notes:
+- expected_hit_rate should equal user cutoff for this PWM-only phase.
+- enrichment_test_count equals total_windows in PWM-only mode.
+
+======================================================================
+5) NUMERICAL FIX: ENRICHMENT P-VALUE STABILITY (POISSON TAIL)
+======================================================================
+
+Observed issue:
+- In high-lambda scenarios (many windows), direct Poisson-tail summation based on
+  exp(-lambda) can underflow to zero and return misleading p-values (including
+  p=1 artifacts when observed_hits is very high).
+
+What changed:
+- Replaced direct-tail accumulation with a regularized incomplete-gamma approach:
+  P(X >= k), X ~ Poisson(lambda) = P(k, lambda) = gamma(k, lambda) / Gamma(k)
+- Implementation uses:
+  1) series expansion when x < a + 1
+  2) continued fraction when x >= a + 1
+  where a=k and x=lambda.
+
+Why this is scientifically and numerically better:
+- It is mathematically equivalent to the Poisson right-tail definition.
+- It is numerically stable for large k/lambda, avoiding underflow artifacts in
+  enrichment p-values.
+
+Regression validation added:
+- `backend/tests/test_statistics.py`
+  - matches direct Poisson tail for small values
+  - confirms very large observed>>expected does not collapse to p=1 artifact
+  - confirms large-lambda/small-observed remains near 1 as expected
+
+======================================================================
+6) REFERENCES SUPPORTING THIS CHANGE
+======================================================================
+
+1. DiDonato AR, Morris AH Jr. Computation of the incomplete gamma function
+   ratios and their inverse. ACM Trans Math Softw. 1986;12(4):377-393.
+   doi:10.1145/22721.23109
+
+2. DiDonato AR, Morris AH Jr. Algorithm 654: FORTRAN subroutines for computing
+   the incomplete gamma function ratios and their inverse.
+   ACM Trans Math Softw. 1987;13(3):318-319. doi:10.1145/29380.214348
+
+3. Gil A, Segura J, Temme NM. Efficient and accurate algorithms for the
+   computation and inversion of the incomplete gamma function ratios.
+   SIAM J Sci Comput. 2013;35(6):A2965-A2981. doi:10.1137/120872553
+
+======================================================================
+7) DIRECTIONAL INTERPRETATION FIELDS ADDED (2026-05-27)
+======================================================================
+
+Added in summary:
+- depletion_p_value = P(X <= observed_hits)
+- two_sided_p_value = min(1, 2*min(enrichment_p_value, depletion_p_value))
+- fold_change = observed_hits / expected_hits
+
+Rationale:
+- One-sided enrichment test (`P(X >= observed)`) is correct for "more than expected",
+  but returns values near 1 when observed is below expected.
+- New fields explicitly quantify depleção and overall two-sided deviation.
+
+Interpretation template:
+- enrichment_p_value small + fold_change > 1:
+  evidence of enrichment.
+- depletion_p_value small + fold_change < 1:
+  evidence of depletion.
+- both not small:
+  no strong deviation under current null.
+
+Concrete project example:
+- observed_hits = 949
+- expected_hits = 1712.7572
+- enrichment_p_value = 1.0
+- depletion_p_value = 1.313470514317874e-90
+- two_sided_p_value = 2.626941028635748e-90
+- fold_change = 0.5540773671831594
+
+Conclusion for this case:
+- Not enriched; strongly depleted.

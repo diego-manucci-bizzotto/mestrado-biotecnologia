@@ -1,0 +1,431 @@
+Current Setup Snapshot - mestrado-biotecnologia
+Date: 2026-05-26
+Purpose: Baseline reference before upcoming scientific/algorithm changes.
+
+======================================================================
+1) STACK AND PROJECT SHAPE
+======================================================================
+
+Root:
+- backend/ (FastAPI)
+- frontend/ (React + TypeScript + Vite + shadcn/ui)
+- docs/
+
+Frontend language:
+- English UI labels/messages
+
+======================================================================
+2) FRONTEND - CURRENT UX AND DEFAULTS
+======================================================================
+
+Main screen:
+- Page: frontend/src/pages/MotifScannerPage.tsx
+- Inputs:
+  1) FASTA file upload
+  2) IUPAC motif text input
+  3) P-value cutoff text input
+
+Current defaults:
+- Scan mode sent by frontend: "pwm" (fixed in UI)
+- P-value cutoff default text: "1e-4"
+- P-value cutoff validation: must be > 0 and <= 1
+- On blur, cutoff input normalizes to scientific notation via toExponential()
+
+Layout details:
+- Parameters card uses min-content-like behavior:
+  - grid has lg:items-start
+  - card has h-min self-start
+- Hits table header is sticky during scroll:
+  - container uses div with overflow-y-auto
+  - table heads use sticky top-0
+
+Table behavior:
+- Columns: Gene, Strand, Position, Sequence, P, Q
+- Display format for P and Q: FIMO-like scientific notation (e.g., 8.11e-04)
+- Sort order in UI:
+  1) lowest q-value first (ascending)
+  2) tie-breaker: lowest p-value first (ascending)
+- Visible rows in table: first 100 rows after sort
+
+Summary cards:
+- Sequences
+- Observed Hits
+- Enrichment p-value
+- Enrichment q-value
+
+======================================================================
+3) BACKEND API - CURRENT CONTRACT
+======================================================================
+
+Router file:
+- backend/app/api/routes.py
+
+Main endpoint:
+- POST /api/analyses
+- Form fields:
+  - file (required)
+  - motif (required, IUPAC consensus)
+  - motif_name (optional)
+  - scan_mode (default "both" in route signature, but frontend currently sends "pwm")
+  - p_value_cutoff (float, default backend constant)
+
+Other endpoints:
+- GET /api/health
+- GET /api/analyses/{analysis_id}
+- GET /api/analyses/{analysis_id}/results
+
+Removed feature:
+- report.txt export endpoint is removed
+
+======================================================================
+4) SCANNING AND STATISTICAL PIPELINE (CURRENT IMPLEMENTATION)
+======================================================================
+
+Core file:
+- backend/app/services/scanner.py
+
+Pipeline:
+1. Parse FASTA records.
+2. Estimate 0-order background frequencies from FASTA (A/C/G/T).
+3. Build motif model:
+   - For user IUPAC, derive PWM (with pseudocount in iupac->pwm flow).
+4. Scan both strands (+ and reverse-complement).
+5. For each window:
+   - Compute PWM log-odds score.
+   - Convert score to p-value using score distribution.
+6. Keep PWM hit if p_value <= p_value_cutoff.
+7. Compute BH q-values for collected hit p-values.
+8. Build summary metrics.
+
+Score distribution logic:
+- backend/app/services/pwm.py
+- If motif length <= 10:
+  - Enumerate all 4^L kmers (exact distribution)
+- If motif length > 10:
+  - Monte Carlo sampled distribution (sample_count=100000, fixed RNG seed)
+
+Per-hit fields:
+- window_p_value
+- gene_p_value (gene-level presence approximation from window probability)
+- q_value (BH corrected over collected hits)
+
+======================================================================
+5) ENRICHMENT METRICS (CURRENT IMPLEMENTATION)
+======================================================================
+
+Global expected hits:
+- expected_hits = total_windows * probability_for_iupac(motif, background)
+
+Global enrichment p-value:
+- poisson_survival(observed_hits, expected_hits)
+- Interpreted as right-tail probability under Poisson null.
+
+Global enrichment q-value:
+- BH over a single p-value list [enrichment_p_value]
+- Practical consequence: enrichment_q_value == enrichment_p_value in current code.
+
+======================================================================
+6) CURRENT SCIENTIFIC LIMITATIONS TO TRACK
+======================================================================
+
+1) Enrichment model mismatch for PWM mode:
+- Hit selection is based on PWM threshold,
+  but expected_hits for enrichment is based on IUPAC probability.
+
+2) q-value family definition:
+- BH is applied to collected hits, not explicitly to all tested windows.
+
+3) Background model:
+- 0-order background only (A/C/G/T frequencies),
+  no higher-order Markov effects.
+
+4) Short motifs behavior:
+- Short/degenerate motifs can produce many hits under null,
+  often leading to weak global enrichment signal (p near 1).
+
+======================================================================
+7) VALUES WE SHOULD PRESERVE UNLESS EXPLICITLY CHANGED
+======================================================================
+
+- Default cutoff in UI: 1e-4
+- UI language: English
+- Sticky table header
+- Sort by lowest q-value first
+- No report.txt export
+
+======================================================================
+8) CHANGE LOG TEMPLATE (FOR NEXT ITERATIONS)
+======================================================================
+
+Change ID:
+Date:
+Files changed:
+
+What changed:
+- ...
+
+Why changed:
+- ...
+
+Expected scientific impact:
+- ...
+
+Validation done:
+- ...
+
+======================================================================
+9) CHANGE LOG ENTRY - 2026-05-27
+======================================================================
+
+Change ID:
+- STATS-POISSON-STABILITY-001
+
+Date:
+- 2026-05-27
+
+Files changed:
+- backend/app/services/statistics.py
+- backend/tests/test_statistics.py
+- docs/pwm_only_cutover_enrichment_changes.txt
+
+What changed:
+- Replaced direct Poisson right-tail accumulation with regularized
+  incomplete-gamma evaluation (series + continued fraction split).
+
+Why changed:
+- Direct exp(-lambda)-based accumulation is numerically unstable for large
+  lambda and can produce underflow artifacts in enrichment p-values.
+
+Expected scientific impact:
+- Enrichment p-values remain mathematically equivalent but numerically stable,
+  especially when total windows and observed hits are large.
+
+Validation done:
+- Backend tests executed with new regression cases.
+- Result: 8 passed.
+
+References:
+- DiDonato AR, Morris AH Jr. ACM Trans Math Softw. 1986;12(4):377-393.
+  doi:10.1145/22721.23109
+- DiDonato AR, Morris AH Jr. ACM Trans Math Softw. 1987;13(3):318-319.
+  doi:10.1145/29380.214348
+- Gil A, Segura J, Temme NM. SIAM J Sci Comput. 2013;35(6):A2965-A2981.
+  doi:10.1137/120872553
+
+======================================================================
+10) CHANGE LOG ENTRY - 2026-05-27 (IMPORT/PATH HOTFIX)
+======================================================================
+
+Change ID:
+- PY-IMPORT-RUNMODE-001
+
+Date:
+- 2026-05-27
+
+Files changed:
+- backend/app/main.py
+- backend/README.md
+- pyrightconfig.json
+- backend/tests/conftest.py
+
+What changed:
+- `main.py` now supports both run modes:
+  - `uvicorn app.main:app` from `backend/` (recommended)
+  - `uvicorn main:app` from `backend/app/` (fallback)
+- Kept package imports consistent for editor/type-checker resolution.
+
+Why changed:
+- Relative imports fail when a module is loaded as top-level (`main`) without
+  package context (`__package__` empty), causing:
+  "attempted relative import with no known parent package".
+
+Expected impact:
+- Eliminates startup crashes caused by cwd/entrypoint mismatch.
+
+Validation done:
+- Import checks passed in both modes.
+- Backend tests passed (8/8).
+
+Reference:
+- Python documentation: relative imports depend on package context and the main
+  module is a special case in the import system.
+  https://docs.python.org/3.10/reference/import.html
+  https://docs.python.org/3/tutorial/modules.html
+
+======================================================================
+11) CHANGE LOG ENTRY - 2026-05-27 (BASIC IMPORT MODE)
+======================================================================
+
+Change ID:
+- PY-BASIC-IMPORTS-002
+
+Date:
+- 2026-05-27
+
+Files changed:
+- backend/app/main.py
+- backend/app/api/routes.py
+- backend/app/services/motifs.py
+- backend/app/services/scanner.py
+- backend/tests/conftest.py
+- backend/tests/test_api_contract.py
+- backend/tests/test_scanner.py
+- backend/tests/test_statistics.py
+- pyrightconfig.json
+- backend/README.md
+
+What changed:
+- Backend moved to basic import style rooted at `backend/app`:
+  - `from api...`, `from schemas...`, `from services...`
+- Tests now import in the same basic style.
+- `main.py` explicitly adds `backend/app` to `sys.path`.
+
+Why changed:
+- Removes dependency on `import app...` package context, which was failing in
+  local execution with `ModuleNotFoundError: No module named 'app'`.
+
+Expected impact:
+- Simpler local startup and less cwd/package ambiguity.
+
+Validation done:
+- Backend tests passed: 8/8.
+- Direct import check passed:
+  - `python -c "import main; print(main.app.title)"` from `backend/app`.
+
+Reference:
+- Python import system and module search path behavior:
+  https://docs.python.org/3/reference/import.html
+- Python tutorial (modules, `sys.path`):
+  https://docs.python.org/3/tutorial/modules.html
+
+======================================================================
+12) CHANGE LOG ENTRY - 2026-05-27 (RUN FROM /BACKEND)
+======================================================================
+
+Change ID:
+- PY-BACKEND-RUNMODE-003
+
+Date:
+- 2026-05-27
+
+Files changed:
+- backend/app/main.py
+- backend/app/api/routes.py
+- backend/app/services/motifs.py
+- backend/app/services/scanner.py
+- backend/tests/conftest.py
+- backend/tests/test_api_contract.py
+- backend/tests/test_scanner.py
+- backend/tests/test_statistics.py
+- backend/README.md
+
+What changed:
+- Normalized internal imports to `app.*` across backend modules and tests.
+- Removed mixed import styles (`api.*`, `services.*`, `backend.app.*`) that
+  made startup depend on current working directory.
+- Standardized backend startup command in README.
+
+Why changed:
+- User requirement: run reliably from `/backend`.
+- Mixed import bases were causing module-resolution instability.
+
+Expected impact:
+- Stable execution from `/backend` with:
+  `python -m uvicorn app.main:app --reload`
+
+Validation done:
+- Import check from `/backend` succeeded (`import app.main`).
+- Backend tests passed (8/8).
+
+Reference:
+- Python import system and module search path (`sys.path`) behavior:
+  https://docs.python.org/3/reference/import.html
+  https://docs.python.org/3/tutorial/modules.html
+
+======================================================================
+13) CHANGE LOG ENTRY - 2026-05-27 (IDE IMPORT RESOLUTION)
+======================================================================
+
+Change ID:
+- PY-RELATIVE-INTERNALS-004
+
+Date:
+- 2026-05-27
+
+Files changed:
+- backend/app/api/routes.py
+- backend/app/services/motifs.py
+- backend/app/services/scanner.py
+
+What changed:
+- Internal module imports in `app/*` switched to package-relative style
+  (`..schemas`, `..services`, `.pwm`, etc.).
+
+Why changed:
+- The IDE was flagging `app.*` imports as unresolved in local editor context.
+- Relative imports are package-robust and independent of IDE source-root setup.
+
+Expected impact:
+- Cleaner editor experience (fewer false unresolved imports) while preserving
+  runtime from `/backend`.
+
+Validation done:
+- Startup import check from `/backend` succeeded.
+- Backend tests passed (8/8).
+
+Reference:
+- Python language reference: package-relative import behavior.
+  https://docs.python.org/3/reference/import.html
+
+======================================================================
+14) CHANGE LOG ENTRY - 2026-05-27 (DIRECTIONAL STATS + FRONT DISPLAY)
+======================================================================
+
+Change ID:
+- STATS-DIRECTIONAL-005
+- FRONT-SUMMARY-METRICS-006
+
+Date:
+- 2026-05-27
+
+Files changed:
+- backend/app/services/statistics.py
+- backend/app/services/scanner.py
+- backend/app/schemas/analysis.py
+- backend/tests/test_statistics.py
+- backend/tests/test_scanner.py
+- backend/tests/test_api_contract.py
+- frontend/src/types/api.ts
+- frontend/src/pages/MotifScannerPage.tsx
+
+What changed:
+- Added directional and effect-size summary fields:
+  - `depletion_p_value = P(X <= observed_hits)`
+  - `two_sided_p_value = min(1, 2*min(P(X >= observed_hits), P(X <= observed_hits)))`
+  - `fold_change = observed_hits / expected_hits`
+- Kept existing enrichment fields unchanged:
+  - `enrichment_p_value`, `enrichment_q_value`
+- Frontend summary cards now display:
+  - Depletion p-value
+  - Two-sided p-value
+  - Fold-change (Obs/Exp)
+
+Why changed:
+- A one-sided enrichment p-value can be ~1 when observed < expected; this is
+  statistically correct but hides depleção signal if shown alone.
+- Directional + two-sided outputs make interpretation explicit and auditable.
+
+Expected scientific impact:
+- Prevents false interpretation of `p=1` as "pipeline bug".
+- Distinguishes "no enrichment" from "strong depletion".
+
+Validation done:
+- Backend tests passed: 10/10.
+- Frontend build passed (`npm run build`).
+- Numeric check for user case:
+  - observed_hits=949
+  - expected_hits=1712.7572
+  - enrichment_p_value=1.0
+  - depletion_p_value=1.313470514317874e-90
+  - two_sided_p_value=2.626941028635748e-90
+  - fold_change=0.5540773671831594
