@@ -1,4 +1,4 @@
-# Mestrado Biotecnologia
+# Motif Scan
 
 Sistema inicial para busca de motifs em promotores, com backend FastAPI e frontend React TS/Vite.
 
